@@ -1,3 +1,7 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
 import { BrowserDriver } from '../driver/driver.interface.js';
 import { ExtensionDriver } from '../driver/extension-driver.js';
 import { CdpDriver } from '../driver/cdp-driver.js';
@@ -9,6 +13,9 @@ import { ImageUploaderHandler } from '../components/image-uploader.js';
 import { ResponseStreamerHandler } from '../components/response-streamer.js';
 import { RetryHandler } from './retry-handler.js';
 import { GeminiOptions, GeminiResponse, StreamChunk } from './types.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export class GeminiAdapter {
   private driver: BrowserDriver;
@@ -55,53 +62,32 @@ export class GeminiAdapter {
   async ask(prompt: string, options?: GeminiOptions): Promise<GeminiResponse> {
     const opts = { ...this.defaultOptions, ...options };
 
-    return new Promise<GeminiResponse>((resolve, reject) => {
-      const id = `req_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      let accumulated = '';
+    const payload: any = { prompt, model: opts.model, timeoutMs: opts.timeoutMs };
+    if (opts.newChat) {
+      payload.url = 'https://gemini.google.com/app';
+    }
 
-      // Bind streaming & completion listeners
-      const deltaListener = (msg: any) => {
-        if (msg.id === id) {
-          accumulated = msg.accumulatedText;
-          if (opts.onChunk) {
-            opts.onChunk({ delta: msg.delta, accumulatedText: accumulated });
-          }
-        }
-      };
-
-      const completeListener = (msg: any) => {
-        if (msg.id === id) {
-          resolve({
-            chatId: msg.chatId || 'https://gemini.google.com/app',
-            text: msg.text || accumulated,
-            images: msg.images ? msg.images.map((img: any) => img.src) : []
-          });
-        }
-      };
-
-      this.driver.onEvent('stream_delta', deltaListener);
-      this.driver.onEvent('turn_complete', completeListener);
-
-      // Execute inject and send action
-      this.driver.executeAction({
-        id,
-        action: 'inject_and_send',
-        payload: { prompt, model: opts.model }
-      }).then((res) => {
-        if (!res.success) {
-          reject(new Error(res.error || 'Failed to dispatch prompt to extension.'));
-        }
-      }).catch(reject);
-
-      // Timeout handler
-      setTimeout(() => {
-        if (accumulated.length > 0) {
-          resolve({ chatId: 'https://gemini.google.com/app', text: accumulated });
-        } else {
-          reject(new Error(`Gemini response timed out after ${opts.timeoutMs}ms`));
-        }
-      }, opts.timeoutMs);
+    const res = await this.driver.executeAction<{
+      success: boolean;
+      turnComplete: boolean;
+      text?: string;
+      chatId?: string;
+      error?: string;
+    }>({
+      action: 'inject_and_send',
+      payload
     });
+
+    if (res.success && res.data && res.data.success && res.data.turnComplete) {
+      return {
+        chatId: res.data.chatId || 'https://gemini.google.com/app',
+        text: res.data.text || '',
+        images: []
+      };
+    }
+
+    const errMsg = res.error || (res.data && res.data.error) || 'Failed to get Gemini response.';
+    throw new Error(errMsg);
   }
 
   async listHistory(): Promise<{ title: string; url: string }[]> {
@@ -188,19 +174,69 @@ export class GeminiAdapter {
     throw new Error(res.error || (res.data ? res.data.error : null) || 'Failed to upload file to Gemini.');
   }
 
-  async uploadFiles(files: string[]): Promise<void> {
+  async uploadFiles(files: string[], options?: GeminiOptions): Promise<void> {
     if (!files || files.length === 0) {
       throw new Error('uploadFiles requires a non-empty list of file paths.');
     }
+    const opts = { ...this.defaultOptions, ...options };
+    const payload: any = { filePaths: files };
+    if (opts.newChat) {
+      payload.url = 'https://gemini.google.com/app';
+    }
     const res = await this.driver.executeAction<{ success: boolean; error?: string }>({
       action: 'file_upload',
-      payload: { filePaths: files } as any
+      payload
     });
 
     if (res.success && res.data && res.data.success) {
       return;
     }
     throw new Error(res.error || (res.data ? res.data.error : null) || 'Failed to upload files to Gemini.');
+  }
+
+  async askWithFiles(query: string, files: string[], options?: GeminiOptions): Promise<GeminiResponse> {
+    if (!files || files.length === 0) {
+      throw new Error('askWithFiles requires at least one file path.');
+    }
+    if (!query || !query.trim()) {
+      throw new Error('askWithFiles requires a non-empty query string.');
+    }
+
+    const opts = { ...this.defaultOptions, ...options };
+
+    // Step 1: Upload files sequentially
+    for (const filePath of files) {
+      const absolutePath = path.resolve(filePath);
+      if (!fs.existsSync(absolutePath)) {
+        throw new Error(`File not found: ${absolutePath}`);
+      }
+
+      const uploadPayload: any = { filePaths: [absolutePath] };
+      if (opts.newChat) {
+        uploadPayload.url = 'https://gemini.google.com/app';
+      }
+
+      const uploadRes = await this.driver.executeAction<{ success: boolean; error?: string }>({
+        action: 'file_upload',
+        payload: uploadPayload
+      });
+
+      if (!uploadRes.success || !uploadRes.data?.success) {
+        throw new Error(uploadRes.error || (uploadRes.data?.error) || `Failed to upload file: ${absolutePath}`);
+      }
+    }
+
+    // Step 2: Verify files are attached (check file input)
+    const verifyRes = await this.driver.executeAction<{ success: boolean; fileInputs: number; error?: string }>({
+      action: 'get_page_info'
+    });
+
+    if (!verifyRes.success || verifyRes.data?.fileInputs === 0) {
+      throw new Error('File upload verification failed: no file inputs found after upload.');
+    }
+
+    // Step 3: Send query with attached files
+    return this.ask(query, options);
   }
 
   async listTabs(): Promise<any[]> {

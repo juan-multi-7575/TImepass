@@ -10,7 +10,7 @@ if (!window.__timepass_content_loaded) {
   const originalError = console.error;
   const originalInfo = console.info;
 
-  const LOG_RATE_LIMIT = 20; // max forwarded logs per second
+  const LOG_RATE_LIMIT = 20;
   let logCount = 0;
   let logWindowStart = Date.now();
   let logDropped = 0;
@@ -96,6 +96,61 @@ if (!window.__timepass_activeMutationObserver) {
   window.__timepass_activeMutationObserver = null;
 }
 
+// Universal waitForElement — MutationObserver + immediate check + timeout
+// Pattern from crawl4ai: check immediately, then observe until found or timeout
+function waitForElement(selector, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const el = document.querySelector(selector);
+    if (el) return resolve(el);
+
+    const observer = new MutationObserver(() => {
+      const el = document.querySelector(selector);
+      if (el) {
+        observer.disconnect();
+        resolve(el);
+      }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(() => {
+      observer.disconnect();
+      reject(new Error(`Timeout waiting for: ${selector}`));
+    }, timeout);
+  });
+}
+
+// Universal observeResponse — waits for completion signal (copy button)
+// then returns response text. Uses crawl4ai waitForElement pattern.
+async function observeResponse(config = {}) {
+  const {
+    responseSelector = 'response-container:last-child',
+    completionSelector = 'response-container:last-child button[aria-label="Copy"]',
+    errorSelectors = ["[role='alert']", "[class*='error']", "[class*=' Error ']"],
+    settleMs = 3000,
+    timeoutMs = 60000
+  } = config;
+
+  // Wait for response container to appear
+  const responseEl = await waitForElement(responseSelector, timeoutMs);
+
+  // Wait for completion signal (copy button)
+  await waitForElement(completionSelector, timeoutMs);
+
+  // Check for errors in response
+  for (const errSel of errorSelectors) {
+    const errEl = responseEl.querySelector(errSel);
+    if (errEl && errEl.innerText && errEl.innerText.trim()) {
+      throw new Error(`Gemini error: ${errEl.innerText.trim()}`);
+    }
+  }
+
+  // Settling delay to ensure all content is rendered
+  await new Promise(r => setTimeout(r, settleMs));
+
+  return responseEl.innerText.trim();
+}
+
 // Multi-tier DOM element selector
 function findInputEditor() {
   const selectors = [
@@ -119,7 +174,6 @@ function simulateTyping(element, text) {
     const chunkSize = 15;
     let i = 0;
     const interval = setInterval(() => {
-      // Check element staleness
       if (!element.isConnected) {
         clearInterval(interval);
         reject(new Error("Element removed from DOM during typing"));
@@ -167,7 +221,6 @@ function readHistory() {
       const url = link.href;
       const title = (link.textContent || "").trim();
       if (!url || seen.has(url)) continue;
-      // Skip the "new chat" / compose link (usually no title or the home route)
       if (!title && url.endsWith("/app")) continue;
       seen.add(url);
       items.push({ title: title || url, url });
@@ -194,137 +247,6 @@ function selectHistory(target) {
   return { success: false, error: "History item not found: " + (title || url || "(no target)") };
 }
 
-// Stream the latest Gemini model response back to the server.
-// Posts {type:"stream_delta", id, delta, accumulatedText} on each change and a
-// debounced {type:"turn_complete", id, text, chatId} once the response settles.
-// (The server's ExtensionDriver relays only stream_delta / turn_complete /
-// extension_log, so those exact type names MUST be used.)
-function startResponseStream(id) {
-  console.log("[Timepass] startResponseStream id=" + id);
-  const RESPONSE_SELECTORS = [
-    "model-response",
-    "[class*='model-response']",
-    ".response-content",
-    ".markdown",
-    "[class*='response']",
-    "[class*='message-content']",
-    "message-content"
-  ];
-
-  function findResponseEl() {
-    const candidates = [];
-    const push = (sel) => {
-      try {
-        document.querySelectorAll(sel).forEach((e) => candidates.push(e));
-      } catch (_e) { /* ignore bad selector */ }
-    };
-    push("model-response");
-    push("[class*='model-response']");
-    push(".markdown");
-    push("[class*='response']");
-    push("[class*='message-content']");
-    push("[class*='conversation']");
-
-    let best = null;
-    let bestLen = -1;
-    const summary = [];
-    for (const el of candidates) {
-      if (!el.isConnected) continue;
-      const cls = typeof el.className === "string" ? el.className : "";
-      // Skip containers that never hold the visible answer.
-      if (cls.includes("tts")) continue;
-      if (cls.includes("visually-hidden") || cls.includes("sr-only")) continue;
-      // Skip completely invisible elements (display:none, zero-size, etc.)
-      if (el.offsetHeight === 0 && el.offsetWidth === 0) continue;
-      const len = (el.innerText || "").trim().length;
-      summary.push("<" + (el.tagName || "?") + "> cls=" + cls.slice(0, 40) + " len=" + len);
-      if (len > bestLen) { bestLen = len; best = el; }
-    }
-    if (summary.length) {
-      console.log("[Timepass] response candidates: " + summary.join(" | "));
-    }
-    if (best) return best;
-    // Fallback: the most recently added VISIBLE message container in the conversation.
-    // Exclude visually-hidden / sr-only accessibility nodes (e.g. cdk-describedby-message-container).
-    const messages = document.querySelectorAll("[class*='message']");
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const el = messages[i];
-      const cls = typeof el.className === "string" ? el.className : "";
-      if (cls.includes("visually-hidden") || cls.includes("sr-only")) continue;
-      if (el.offsetHeight === 0 && el.offsetWidth === 0) continue;
-      return el;
-    }
-    return null;
-  }
-
-  if (window.__timepass_activeMutationObserver) {
-    window.__timepass_activeMutationObserver.disconnect();
-    window.__timepass_activeMutationObserver = null;
-  }
-
-  let lastText = "";
-  let settleTimer = null;
-  let lastMutationTime = 0;
-
-  function emit(text) {
-    if (!text || text === lastText) return;
-    lastText = text;
-    chrome.runtime.sendMessage({
-      type: "stream_delta",
-      id: id,
-      delta: text,
-      accumulatedText: text
-    });
-  }
-
-  function finish(text) {
-    console.log("[Timepass] turn_complete id=" + id + " len=" + (text || lastText || "").length);
-    chrome.runtime.sendMessage({
-      type: "turn_complete",
-      id: id,
-      text: text || lastText,
-      chatId: window.location.href
-    });
-  }
-
-  const observer = new MutationObserver(() => {
-    const now = Date.now();
-    if (now - lastMutationTime < 100) return; // throttle to ~10/sec
-    lastMutationTime = now;
-
-    const el = findResponseEl();
-    if (!el || !el.isConnected) return;
-    const text = el.innerText || "";
-    emit(text);
-    if (settleTimer) clearTimeout(settleTimer);
-    settleTimer = setTimeout(() => {
-      observer.disconnect();
-      window.__timepass_activeMutationObserver = null;
-      finish(lastText);
-    }, 1200);
-  });
-
-  // Poll for the response element (Gemini renders it after Send; image analysis
-  // can take several seconds, so we poll for up to 20 seconds).
-  let attempts = 0;
-  const MAX_POLL = 100; // 100 * 200ms = 20s
-  const poll = setInterval(() => {
-    const el = findResponseEl();
-    if (el) {
-      clearInterval(poll);
-      observer.observe(el, { childList: true, characterData: true, subtree: true });
-      window.__timepass_activeMutationObserver = observer;
-      console.log("[Timepass] response element found: <" + (el.tagName || "?") + "> cls=" + (typeof el.className === "string" ? el.className.slice(0, 60) : ""));
-      const initial = el.innerText || "";
-      if (initial) emit(initial);
-    } else if (++attempts >= MAX_POLL) {
-      clearInterval(poll);
-      console.warn("[Timepass] response element never found; finishing stream");
-      finish(lastText);
-    }
-  }, 200);
-}
-
 // Chrome message handler (registered only once per page load)
 if (!window.__timepass_listener_registered) {
   window.__timepass_listener_registered = true;
@@ -334,30 +256,44 @@ if (!window.__timepass_listener_registered) {
 
     // Live path used by the adapter: type the prompt then click Send.
     if (action === "inject_and_send") {
-      const text = (payload && (payload.prompt || payload.text)) || "";
-      const editor = findInputEditor();
-      if (!editor) {
-        sendResponse({ success: false, error: "Input editor not found" });
-        return;
-      }
-      if (!text) {
-        sendResponse({ success: false, error: "Missing payload.prompt" });
-        return;
-      }
-      simulateTyping(editor, text).then(() => {
-        const btn = findSendButton();
-        if (btn) {
-          console.log("[Timepass] clicking send button");
-          btn.click();
-        } else {
-          console.warn("[Timepass] send button NOT found after typing");
+      (async () => {
+        const text = (payload && (payload.prompt || payload.text)) || "";
+        const editor = findInputEditor();
+        if (!editor) {
+          sendResponse({ success: false, error: "Input editor not found" });
+          return;
         }
-        sendResponse({ success: true });
-        // Begin streaming the model response back to the server.
-        startResponseStream(message.id);
-      }).catch((err) => {
-        sendResponse({ success: false, error: err.message });
-      });
+        if (!text) {
+          sendResponse({ success: false, error: "Missing payload.prompt" });
+          return;
+        }
+
+        try {
+          await simulateTyping(editor, text);
+          const btn = findSendButton();
+          if (btn) {
+            console.log("[Timepass] clicking send button");
+            btn.click();
+          } else {
+            console.warn("[Timepass] send button NOT found after typing");
+          }
+
+          // Wait for response completion (copy button signal)
+          const responseText = await observeResponse({
+            settleMs: payload?.settleMs || 3000,
+            timeoutMs: payload?.timeoutMs || 60000
+          });
+
+          sendResponse({
+            success: true,
+            turnComplete: true,
+            text: responseText,
+            chatId: window.location.href
+          });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
       return true; // keep message channel open for async
     }
 
@@ -377,7 +313,7 @@ if (!window.__timepass_listener_registered) {
         sendResponse({ success: false, error: "Input editor not found" });
         return;
       }
-      if (!payload || !payload.text) {
+      if (payload || !payload.text) {
         sendResponse({ success: false, error: "Missing payload.text" });
         return;
       }
@@ -398,12 +334,6 @@ if (!window.__timepass_listener_registered) {
       }
 
       button.click();
-      sendResponse({ success: true });
-    }
-
-    if (action === "stream_response") {
-      // Delegate to the shared streaming helper (id-tagged, correct relay types).
-      startResponseStream(message.id);
       sendResponse({ success: true });
     }
 
@@ -440,11 +370,7 @@ if (!window.__timepass_listener_registered) {
       });
     }
 
-    // Sync handlers returned sendResponse above; return undefined (no return)
-    // to close the channel cleanly.
-    // Fallback: any unhandled action must still respond with an object so the
-    // background's sendMessageWithRetry never sees `undefined` (which would
-    // otherwise be treated as a pending async response and trigger retries).
+    // Fallback: any unhandled action must still respond with an object
     sendResponse({ success: false, error: "Unknown action: " + action });
     return;
   });
@@ -472,14 +398,12 @@ function serializeSubtree(rootSelector, opts = {}) {
       } : null
     };
 
-    // Add attributes
     if (el.attributes) {
       for (const attr of el.attributes) {
         node.attributes[attr.name] = attr.value;
       }
     }
 
-    // Form values
     if ("value" in el) node.value = el.value;
     if ("checked" in el) node.checked = el.checked;
 

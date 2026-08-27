@@ -9,7 +9,7 @@ const __dirname = path.dirname(__filename);
 
 function showUsage() {
   console.log(`
-Usage: timepass <command> [argument] [--model <flash|pro|thinking>]
+Usage: timepass <command> [argument] [--model <flash|pro|thinking>] [--new-chat]
 
 Commands:
   ask              Send prompt to Gemini and print the full response
@@ -21,7 +21,7 @@ Commands:
   cookies-get      Save browser session cookies for a given domain to a JSON file
   cookies-restore  Restore browser session cookies from a JSON file for a domain
   test-upload      Run diagnostic flow to locate upload menus and file inputs
-  ask-files        Upload one or more files then send a prompt (query first, then file paths)
+  ask-with-files   Upload one or more files then send a prompt (query first, then file paths)
   tab-list         List all Gemini tabs
   tab-create       Create a new Gemini tab (optionally with URL)
   tab-close        Close a tab by ID
@@ -32,10 +32,12 @@ Commands:
 
 Options:
   --model          Select Gemini model (e.g. flash, pro, thinking)
+  --new-chat       Start a fresh Gemini conversation (applies to ask, stream, ask-files)
 
 Example:
   npx timepass ask "What is quantum computing?" --model pro
   npx timepass stream "Tell me a joke" --model flash
+  npx timepass ask "Hello" --new-chat
   npx timepass history
   npx timepass screenshot
   npx timepass dom-dump "rich-textarea"
@@ -53,6 +55,8 @@ async function main() {
   if (modelIdx !== -1 && args[modelIdx + 1]) {
     model = args[modelIdx + 1] as any;
   }
+
+  const newChat = args.includes('--new-chat');
 
   if (!command) {
     showUsage();
@@ -211,14 +215,14 @@ async function main() {
       await adapter.uploadFile({ filePath });
       console.log('[timepass CLI] File upload complete!');
 
-    } else if (command === 'ask-files') {
+    } else if (command === 'ask-with-files') {
       if (!argument) {
-        throw new Error("Command 'ask-files' requires a query string as the first argument, followed by one or more file paths.");
+        throw new Error("Command 'ask-with-files' requires a query string as the first argument, followed by one or more file paths.");
       }
       const query = argument;
       const filePaths = args.slice(2).map((p) => path.resolve(process.cwd(), p));
       if (filePaths.length === 0) {
-        throw new Error("Command 'ask-files' requires at least one file path argument.");
+        throw new Error("Command 'ask-with-files' requires at least one file path argument.");
       }
       for (const fp of filePaths) {
         if (!fs.existsSync(fp)) {
@@ -226,9 +230,7 @@ async function main() {
         }
       }
       console.log(`[timepass CLI] Uploading ${filePaths.length} file(s) to Gemini...`);
-      await adapter.uploadFiles(filePaths);
-      console.log(`[timepass CLI] Files attached. Sending prompt: "${query}"...`);
-      const response = await adapter.ask(query, { model });
+      const response = await adapter.askWithFiles(query, filePaths, { model, newChat });
       console.log(`\nResponse:\n${response.text}`);
       const outputPath = path.resolve(__dirname, '../response.md');
       fs.writeFileSync(outputPath, response.text, 'utf-8');
@@ -243,6 +245,7 @@ async function main() {
         console.log(`[timepass CLI] Sending prompt: "${prompt}"\n---`);
         const response = await adapter.ask(prompt, {
           model,
+          newChat,
           onChunk: (chunk) => {
             process.stdout.write(chunk.delta);
           }
@@ -252,7 +255,7 @@ async function main() {
         images = response.images || [];
       } else if (command === 'ask') {
         console.log(`[timepass CLI] Sending prompt: "${prompt}"...`);
-        const response = await adapter.ask(prompt, { model });
+        const response = await adapter.ask(prompt, { model, newChat });
         console.log(`\nResponse:\n${response.text}`);
         finalResponseText = response.text;
         images = response.images || [];

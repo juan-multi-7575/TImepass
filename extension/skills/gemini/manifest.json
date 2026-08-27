@@ -1,0 +1,45 @@
+{
+  "id": "gemini",
+  "name": "Google Gemini",
+  "domains": ["gemini.google.com", "*.gemini.google.com"],
+  "selectors": {
+    "promptInput": ["rich-textarea .ql-editor"],
+    "sendButton": ["button[aria-label*='Send']", "button[aria-label*='send']", "button[mattooltip*='Send']"],
+    "responseContainer": ["response-container:last-child"],
+    "completionSignal": ["response-container:last-child button[aria-label='Copy']"],
+    "fileInput": ["input[type='file']"],
+    "errorSelectors": ["[role='alert']", "[class*='error']", "[class*=' Error ']"]
+  },
+  "observe": {
+    "responseSelector": "response-container:last-child",
+    "completionSelector": "response-container:last-child button[aria-label='Copy']",
+    "errorSelectors": ["[role='alert']", "[class*='error']", "[class*=' Error ']"],
+    "settleMs": 3000,
+    "timeoutMs": 60000,
+    "pollIntervalMs": 200
+  },
+  "nodeTools": {
+    "file_upload": {
+      "description": "Upload files to Gemini via CDP",
+      "path": "tools/file-upload.js",
+      "callable": "fileUpload",
+      "args": {
+        "filePaths": {
+          "type": "array",
+          "required": true,
+          "description": "Absolute paths to files to upload"
+        }
+      },
+      "returns": {
+        "type": "object",
+        "description": "{ success: boolean, uploaded: string[], error?: string }"
+      }
+    }
+  },
+  "notes": {
+    "completionSignal": "button[aria-label='Copy'] appears in response-container-footer when response is complete",
+    "multipleResponses": "New responses are appended to DOM; last response-container is always newest",
+    "fileUpload": "Files must be uploaded before sending query; they appear as attachments in input area",
+    "errorDetection": "Check for [role='alert'] and [class*='error'] in response container"
+  }
+}
