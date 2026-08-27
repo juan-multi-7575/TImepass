@@ -174,7 +174,7 @@ async function ensureTabGroup(tabId) {
 }
 
 // Helper to send message to tab with retry while content.js initializes
-async function sendMessageWithRetry(tabId, message, maxRetries = 12) {
+async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
     try {
       const res = await chrome.tabs.sendMessage(tabId, message);
@@ -183,28 +183,34 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 12) {
       }
       throw new Error("Receiving end returned undefined.");
     } catch (err) {
-      // If connection fails, the script is likely orphaned. Inject programmatically!
-      if (err.message.includes("Could not establish connection") || 
-          err.message.includes("Receiving end does not exist") || 
-          err.message.includes("returned undefined")) {
-        if (i === 0) {
-          console.log("[Timepass MV3] Content script is orphaned or not responding. Injecting content.js programmatically...");
-          try {
-            await chrome.scripting.executeScript({
-              target: { tabId: tabId },
-              files: ["content.js"]
-            });
-            await new Promise((r) => setTimeout(r, 500));
-          } catch (injectErr) {
-            console.error("[Timepass MV3] Programmatic injection failed:", injectErr);
-          }
-          continue;
-        }
+      const isConnectionError = err.message.includes("Could not establish connection") || 
+                                err.message.includes("Receiving end does not exist") || 
+                                err.message.includes("returned undefined");
+      
+      if (isConnectionError && i === 0) {
+        console.warn("[Timepass MV3] Content script unreachable. Re-injecting...");
+        
+        // Reset the guard so re-injection registers the listener
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => { window.__timepass_listener_registered = false; }
+        }).catch(() => { /* Ignore if context is completely gone */ });
+
+        // Re-inject the script. The promise resolves ONLY after 
+        // the script (and its top-level onMessage listener) has executed.
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ["content.js"]
+        });
+        
+        // No arbitrary setTimeout needed. The listener is registered.
+        continue;
       }
-      if (i === maxRetries - 1) throw err;
-      await new Promise((r) => setTimeout(r, 800));
+      
+      throw err;
     }
   }
+  throw new Error("Max retries exceeded for tabId: " + tabId);
 }
 
 // Handle action dispatch from server to content script

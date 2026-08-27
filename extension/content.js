@@ -105,177 +105,132 @@ function simulateTyping(element, text) {
   });
 }
 
-// Chrome message handler (registered on every injection)
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const { action, payload } = message || {};
+// Chrome message handler (registered only once per page load)
+if (!window.__timepass_listener_registered) {
+  window.__timepass_listener_registered = true;
 
-  if (action === "type_prompt") {
-    const editor = findInputEditor();
-    if (!editor) {
-      sendResponse({ success: false, error: "Input editor not found" });
-      return;
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    const { action, payload } = message || {};
+
+    if (action === "type_prompt") {
+      const editor = findInputEditor();
+      if (!editor) {
+        sendResponse({ success: false, error: "Input editor not found" });
+        return;
+      }
+      simulateTyping(editor, payload.text).then(() => {
+        sendResponse({ success: true });
+      });
+      return true; // keep message channel open for async
     }
-    simulateTyping(editor, payload.text).then(() => {
+
+    if (action === "click_send") {
+      const selectors = [
+        'button[aria-label*="Send"]',
+        'button[aria-label*="send"]',
+        'button.send-button',
+        'button[mattooltip*="Send"]',
+        'button[aria-label*="Submit"]',
+        'button[aria-label*="Generate"]'
+      ];
+
+      let button = null;
+      for (const sel of selectors) {
+        button = document.querySelector(sel);
+        if (button) break;
+      }
+
+      if (!button) {
+        sendResponse({ success: false, error: "Send button not found" });
+        return;
+      }
+
+      button.click();
       sendResponse({ success: true });
-    });
-    return true; // keep message channel open for async
-  }
-
-  if (action === "click_send") {
-    const selectors = [
-      'button[aria-label*="Send"]',
-      'button[aria-label*="send"]',
-      'button.send-button',
-      'button[mattooltip*="Send"]',
-      'button[aria-label*="Submit"]',
-      'button[aria-label*="Generate"]'
-    ];
-
-    let button = null;
-    for (const sel of selectors) {
-      button = document.querySelector(sel);
-      if (button) break;
     }
 
-    if (!button) {
-      sendResponse({ success: false, error: "Send button not found" });
-      return;
-    }
+    if (action === "stream_response") {
+      const selectors = [
+        ".response-content",
+        ".markdown",
+        "[class*='response']",
+        "[class*='model-response']",
+        "[class*='message-content']"
+      ];
 
-    button.click();
-    sendResponse({ success: true });
-  }
-
-  if (action === "stream_response") {
-    const selectors = [
-      ".response-content",
-      ".markdown",
-      "[class*='response']",
-      "[class*='model-response']",
-      "[class*='message-content']"
-    ];
-
-    let responseEl = null;
-    for (const sel of selectors) {
-      responseEl = document.querySelector(sel);
-      if (responseEl) break;
-    }
-
-    if (!responseEl) {
-      sendResponse({ success: false, error: "Response element not found" });
-      return;
-    }
-
-    // Set up MutationObserver to stream response
-    if (window.__timepass_activeMutationObserver) {
-      window.__timepass_activeMutationObserver.disconnect();
-    }
-
-    window.__timepass_activeMutationObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === "childList" || mutation.type === "characterData") {
-          const text = responseEl.innerText;
-          chrome.runtime.sendMessage({
-            type: "response_chunk",
-            text: text
-          });
-        }
-      }
-    });
-
-    window.__timepass_activeMutationObserver.observe(responseEl, {
-      childList: true,
-      characterData: true,
-      subtree: true
-    });
-
-    sendResponse({ success: true });
-  }
-
-  if (action === "get_status") {
-    sendResponse({
-      success: true,
-      url: window.location.href,
-      hasInput: !!findInputEditor()
-    });
-  }
-
-  if (action === "click_button") {
-    try {
-      const btn = document.querySelector(payload.selector);
-      if (!btn) {
-        sendResponse({ success: false, error: "Button not found: " + payload.selector });
-        return;
-      }
-      btn.click();
-      sendResponse({ success: true, result: "clicked" });
-    } catch (err) {
-      sendResponse({ success: false, error: err.message });
-    }
-  }
-
-  if (action === "file_upload") {
-    try {
-      const { base64Data, fileName, mimeType } = payload;
-
-      // Step 1: Click the upload button to reveal the file input
-      const uploadBtn = document.querySelector("button[aria-label='Upload and tools']");
-      if (uploadBtn) {
-        uploadBtn.click();
+      let responseEl = null;
+      for (const sel of selectors) {
+        responseEl = document.querySelector(sel);
+        if (responseEl) break;
       }
 
-      // Step 2: Poll for file input to appear (max 3 seconds)
-      let input = null;
-      for (let i = 0; i < 30; i++) {
-        const inputs = document.querySelectorAll("input[type='file']");
-        if (inputs.length > 0) {
-          input = inputs[0];
-          break;
-        }
-        // Busy wait 100ms
-        const start = Date.now();
-        while (Date.now() - start < 100) { /* spin */ }
-      }
-      if (!input) {
-        sendResponse({ success: false, error: "No file input found" });
+      if (!responseEl) {
+        sendResponse({ success: false, error: "Response element not found" });
         return;
       }
 
-      // Step 3: Decode base64 to binary
-      const binaryString = atob(base64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      // Set up MutationObserver to stream response
+      if (window.__timepass_activeMutationObserver) {
+        window.__timepass_activeMutationObserver.disconnect();
       }
-      const blob = new Blob([bytes], { type: mimeType });
-      const file = new File([blob], fileName, { type: mimeType });
 
-      // Step 4: Create DataTransfer and set files
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      Object.defineProperty(input, 'files', { value: dt.files, configurable: true });
+      window.__timepass_activeMutationObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (mutation.type === "childList" || mutation.type === "characterData") {
+            const text = responseEl.innerText;
+            chrome.runtime.sendMessage({
+              type: "response_chunk",
+              text: text
+            });
+          }
+        }
+      });
 
-      // Step 5: Dispatch change event
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      input.dispatchEvent(new Event('input', { bubbles: true }));
+      window.__timepass_activeMutationObserver.observe(responseEl, {
+        childList: true,
+        characterData: true,
+        subtree: true
+      });
 
-      sendResponse({ success: true, result: "file set on input" });
-    } catch (err) {
-      sendResponse({ success: false, error: err.message });
+      sendResponse({ success: true });
     }
-  }
 
-  if (action === "get_page_info") {
-    sendResponse({
-      success: true,
-      url: window.location.href,
-      title: document.title,
-      fileInputs: document.querySelectorAll("input[type='file']").length,
-      dropzones: document.querySelectorAll("[xapfileselectordropzone]").length,
-      buttons: document.querySelectorAll("button").length
-    });
-  }
-});
+    if (action === "get_status") {
+      sendResponse({
+        success: true,
+        url: window.location.href,
+        hasInput: !!findInputEditor()
+      });
+    }
+
+    if (action === "click_button") {
+      try {
+        const btn = document.querySelector(payload.selector);
+        if (!btn) {
+          sendResponse({ success: false, error: "Button not found: " + payload.selector });
+          return;
+        }
+        btn.click();
+        sendResponse({ success: true, result: "clicked" });
+      } catch (err) {
+        sendResponse({ success: false, error: err.message });
+      }
+    }
+
+    if (action === "get_page_info") {
+      sendResponse({
+        success: true,
+        url: window.location.href,
+        title: document.title,
+        fileInputs: document.querySelectorAll("input[type='file']").length,
+        dropzones: document.querySelectorAll("[xapfileselectordropzone]").length,
+        buttons: document.querySelectorAll("button").length
+      });
+    }
+
+    return true;
+  });
+}
 
 // DOM Subtree Serializer
 function serializeSubtree(rootSelector, opts = {}) {
