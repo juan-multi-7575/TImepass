@@ -205,8 +205,8 @@ function startResponseStream(id) {
       const cls = typeof el.className === "string" ? el.className : "";
       // Skip text-to-speech / hidden containers that never hold the answer.
       if (cls.includes("tts")) continue;
-      let display = "";
-      try { display = getComputedStyle(el).display; } catch (_e) { display = ""; }
+      let display = "inline";
+      try { display = getComputedStyle(el).display; } catch (_e) { /* ignore */ }
       if (display === "none") continue;
       const len = (el.innerText || "").trim().length;
       summary.push("<" + (el.tagName || "?") + "> cls=" + cls.slice(0, 40) + " len=" + len);
