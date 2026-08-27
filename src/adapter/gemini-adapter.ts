@@ -188,6 +188,21 @@ export class GeminiAdapter {
     throw new Error(res.error || (res.data ? res.data.error : null) || 'Failed to upload file to Gemini.');
   }
 
+  async uploadFiles(files: string[]): Promise<void> {
+    if (!files || files.length === 0) {
+      throw new Error('uploadFiles requires a non-empty list of file paths.');
+    }
+    const res = await this.driver.executeAction<{ success: boolean; error?: string }>({
+      action: 'file_upload',
+      payload: { filePaths: files } as any
+    });
+
+    if (res.success && res.data && res.data.success) {
+      return;
+    }
+    throw new Error(res.error || (res.data ? res.data.error : null) || 'Failed to upload files to Gemini.');
+  }
+
   async listTabs(): Promise<any[]> {
     const res = await this.driver.executeAction<any>({ action: 'tab_list' });
     if (res.success && res.data && res.data.tabs) return res.data.tabs;

@@ -21,6 +21,7 @@ Commands:
   cookies-get      Save browser session cookies for a given domain to a JSON file
   cookies-restore  Restore browser session cookies from a JSON file for a domain
   test-upload      Run diagnostic flow to locate upload menus and file inputs
+  ask-files        Upload one or more files then send a prompt (query first, then file paths)
   tab-list         List all Gemini tabs
   tab-create       Create a new Gemini tab (optionally with URL)
   tab-close        Close a tab by ID
@@ -209,6 +210,29 @@ async function main() {
       console.log(`[timepass CLI] Uploading file: ${filePath}...`);
       await adapter.uploadFile({ filePath });
       console.log('[timepass CLI] File upload complete!');
+
+    } else if (command === 'ask-files') {
+      if (!argument) {
+        throw new Error("Command 'ask-files' requires a query string as the first argument, followed by one or more file paths.");
+      }
+      const query = argument;
+      const filePaths = args.slice(2).map((p) => path.resolve(process.cwd(), p));
+      if (filePaths.length === 0) {
+        throw new Error("Command 'ask-files' requires at least one file path argument.");
+      }
+      for (const fp of filePaths) {
+        if (!fs.existsSync(fp)) {
+          throw new Error(`File not found at: ${fp}`);
+        }
+      }
+      console.log(`[timepass CLI] Uploading ${filePaths.length} file(s) to Gemini...`);
+      await adapter.uploadFiles(filePaths);
+      console.log(`[timepass CLI] Files attached. Sending prompt: "${query}"...`);
+      const response = await adapter.ask(query, { model });
+      console.log(`\nResponse:\n${response.text}`);
+      const outputPath = path.resolve(__dirname, '../response.md');
+      fs.writeFileSync(outputPath, response.text, 'utf-8');
+      console.log(`[timepass CLI] Response successfully saved to: ${outputPath}`);
 
     } else {
       let finalResponseText = '';

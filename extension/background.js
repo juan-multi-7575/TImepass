@@ -281,10 +281,15 @@ async function handleServerMessage(message) {
       const debuggee = { tabId: tab.id };
       let debuggerAttached = false;
       
-      try {
-        const { filePath } = payload;
-        
-        // Step 1: Attach debugger
+        try {
+          const filePaths = Array.isArray(payload.filePaths)
+            ? payload.filePaths
+            : (payload.filePath ? [payload.filePath] : []);
+          if (filePaths.length === 0) {
+            throw new Error('file_upload requires payload.filePath or payload.filePaths');
+          }
+          
+          // Step 1: Attach debugger
         try {
           await chrome.debugger.attach(debuggee, "1.3");
           debuggerAttached = true;
@@ -304,7 +309,7 @@ async function handleServerMessage(message) {
         if (lightDomNodeId) {
           // File input found in light DOM, set file directly
           await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-            files: [filePath],
+            files: filePaths,
             nodeId: lightDomNodeId
           });
           await chrome.debugger.detach(debuggee);
@@ -349,7 +354,7 @@ async function handleServerMessage(message) {
           
           if (shadowNodeId) {
             await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-              files: [filePath],
+              files: filePaths,
               nodeId: shadowNodeId
             });
             await chrome.debugger.detach(debuggee);
@@ -414,7 +419,7 @@ async function handleServerMessage(message) {
           
           if (afterClickNodeId) {
             await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-              files: [filePath],
+              files: filePaths,
               nodeId: afterClickNodeId
             });
             await chrome.debugger.detach(debuggee);
@@ -486,7 +491,7 @@ async function handleServerMessage(message) {
         }
         
         await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-          files: [filePath],
+          files: filePaths,
           nodeId: finalNodeId
         });
         
