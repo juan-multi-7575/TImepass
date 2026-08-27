@@ -87,10 +87,16 @@ function findInputEditor() {
 
 // Typing simulation
 function simulateTyping(element, text) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const chunkSize = 15;
     let i = 0;
     const interval = setInterval(() => {
+      // Check element staleness
+      if (!element.isConnected) {
+        clearInterval(interval);
+        reject(new Error("Element removed from DOM during typing"));
+        return;
+      }
       if (i >= text.length) {
         clearInterval(interval);
         element.dispatchEvent(new Event("input", { bubbles: true }));
@@ -118,8 +124,14 @@ if (!window.__timepass_listener_registered) {
         sendResponse({ success: false, error: "Input editor not found" });
         return;
       }
+      if (!payload || !payload.text) {
+        sendResponse({ success: false, error: "Missing payload.text" });
+        return;
+      }
       simulateTyping(editor, payload.text).then(() => {
         sendResponse({ success: true });
+      }).catch((err) => {
+        sendResponse({ success: false, error: err.message });
       });
       return true; // keep message channel open for async
     }
@@ -177,6 +189,11 @@ if (!window.__timepass_listener_registered) {
       window.__timepass_activeMutationObserver = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
           if (mutation.type === "childList" || mutation.type === "characterData") {
+            // Skip if element was removed from DOM
+            if (!responseEl.isConnected) {
+              window.__timepass_activeMutationObserver.disconnect();
+              return;
+            }
             const text = responseEl.innerText;
             chrome.runtime.sendMessage({
               type: "response_chunk",
@@ -228,7 +245,9 @@ if (!window.__timepass_listener_registered) {
       });
     }
 
-    return true;
+    // Sync handlers returned sendResponse above; return undefined (no return)
+    // to close the channel cleanly.
+    return;
   });
 }
 

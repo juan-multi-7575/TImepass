@@ -182,12 +182,15 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
         return res;
       }
       // Listener returned undefined - it might be async (returned true)
-      // Wait and retry without re-injecting
+      // Wait briefly and retry once more, but don't re-inject for async responses
+      // Re-injection would close the message channel and cause the error:
+      // "A listener indicated an asynchronous response by returning true, 
+      // but the message channel closed before a response was received"
       if (i < maxRetries - 1) {
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 300));
         continue;
       }
-      throw new Error("Receiving end returned undefined.");
+      throw new Error("Receiving end returned undefined after " + maxRetries + " retries.");
     } catch (err) {
       // Only re-inject on actual connection errors (no listener registered)
       const isConnectionError = err.message.includes("Could not establish connection") || 
@@ -207,7 +210,7 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
         await chrome.scripting.executeScript({
           target: { tabId },
           files: ["content.js"]
-        });
+        }).catch(() => { /* Ignore if re-injection fails */ });
         
         continue;
       }
@@ -610,7 +613,11 @@ setInterval(() => {
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message.type === "stream_delta" || message.type === "turn_complete" || message.type === "extension_log") {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message));
+      try {
+        ws.send(JSON.stringify(message));
+      } catch (err) {
+        console.error("[Timepass MV3] Failed to relay message to server:", err);
+      }
     }
   }
 });
