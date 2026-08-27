@@ -11,12 +11,21 @@
     "errorSelectors": ["[role='alert']", "[class*='error']", "[class*=' Error ']"]
   },
   "observe": {
-    "responseSelector": "response-container:last-child",
-    "completionSelector": "response-container:last-child button[aria-label='Copy']",
+    "mode": "broad",
+    "scope": "main",
+    "responseSelector": "response-container",
+    "completionSelector": "response-container button[aria-label='Copy']",
+    "responseSelectorStrategy": "last",
     "errorSelectors": ["[role='alert']", "[class*='error']", "[class*=' Error ']"],
     "settleMs": 3000,
     "timeoutMs": 60000,
-    "pollIntervalMs": 200
+    "pollIntervalMs": 600,
+    "broad": {
+      "settleMs": 3000,
+      "pollMs": 600,
+      "copySignalEnabled": true,
+      "textStabilityMs": 3000
+    }
   },
   "nodeTools": {
     "file_upload": {

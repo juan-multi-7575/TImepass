@@ -96,6 +96,135 @@ if (!window.__timepass_activeMutationObserver) {
   window.__timepass_activeMutationObserver = null;
 }
 
+// ========== BROAD DOM READER ENGINE (site-agnostic) ==========
+
+function getMainContentRoot() {
+  const candidates = ['main', '[role="main"]', '.conversation-container', '#chat-container', '.chat-history', 'response-container'];
+  for (const sel of candidates) {
+    const el = document.querySelector(sel);
+    if (el) {
+      // Prefer the parent that holds all responses if we matched a single response
+      if (sel === 'response-container' && el.parentElement) return el.parentElement;
+      return el.closest('main') || el.parentElement || el;
+    }
+  }
+  return document.body;
+}
+
+class DomReader {
+  snapshot(root) {
+    const r = root || getMainContentRoot();
+    const nodes = [];
+    const walker = document.createTreeWalker(r, NodeFilter.SHOW_ELEMENT, null);
+    let n;
+    while ((n = walker.nextNode())) {
+      if (n === r) continue;
+      const rect = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      nodes.push({
+        tag: n.tagName ? n.tagName.toLowerCase() : '',
+        cls: typeof n.className === 'string' ? n.className.slice(0, 80) : '',
+        id: n.id || '',
+        text: (n.innerText || '').trim().slice(0, 200),
+        textLen: (n.innerText || '').trim().length,
+        rect: rect ? { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) } : null,
+        visible: !!(n.offsetWidth || n.offsetHeight || n.getClientRects().length),
+        aria: n.getAttribute ? (n.getAttribute('aria-label') || '') : ''
+      });
+      if (nodes.length > 5000) break;
+    }
+    return {
+      ts: Date.now(),
+      rootTag: r.tagName,
+      text: r.innerText ? r.innerText.slice(0, 8000) : '',
+      textLen: r.innerText ? r.innerText.length : 0,
+      nodes,
+      stats: {
+        total: nodes.length,
+        visible: nodes.filter(x => x.visible).length,
+        buttons: r.querySelectorAll ? r.querySelectorAll('button, [role="button"]').length : 0
+      }
+    };
+  }
+}
+
+class DomDiffer {
+  diff(prev, curr) {
+    if (!prev) return { added: curr.nodes.length, removed: 0, textDelta: curr.textLen, changed: curr.nodes.length, stable: false };
+    const prevMap = new Map(prev.nodes.map(n => [n.tag + '|' + n.cls.slice(0, 40) + '|' + (n.text || '').slice(0, 40), n]));
+    let added = 0, removed = 0, changed = 0, layoutShifts = 0;
+    const currKeys = new Set();
+    for (const n of curr.nodes) {
+      const k = n.tag + '|' + n.cls.slice(0, 40) + '|' + (n.text || '').slice(0, 40);
+      currKeys.add(k);
+      const p = prevMap.get(k);
+      if (!p) added++;
+      else {
+        if (p.text !== n.text) changed++;
+        if (p.rect && n.rect && (p.rect.x !== n.rect.x || p.rect.y !== n.rect.y)) layoutShifts++;
+      }
+    }
+    for (const k of prevMap.keys()) if (!currKeys.has(k)) removed++;
+    return {
+      added, removed, changed, layoutShifts,
+      textDelta: curr.textLen - prev.textLen,
+      stable: added === 0 && removed === 0 && changed === 0 && layoutShifts === 0
+    };
+  }
+}
+
+class CompletionHeuristic {
+  constructor(opts) {
+    this.settleMs = (opts && opts.settleMs) || 3000;
+    this.snapshots = [];
+  }
+  push(snap) { this.snapshots.push(snap); if (this.snapshots.length > 20) this.snapshots.shift(); }
+  hasCopySignal(snap) {
+    return snap.nodes.some(n => n.aria && /copy/i.test(n.aria) && n.visible) ||
+           /copy/i.test(snap.text) && snap.nodes.some(n => n.tag === 'button' && n.visible);
+  }
+  hasErrorSignal(snap) {
+    return snap.nodes.some(n => n.aria && /error|alert/i.test(n.aria)) ||
+           snap.text.toLowerCase().includes('something went wrong') ||
+           snap.text.toLowerCase().includes('failed to generate');
+  }
+  textStableFor(ms) {
+    if (this.snapshots.length < 2) return false;
+    const now = this.snapshots[this.snapshots.length - 1].ts;
+    let stableSince = now;
+    for (let i = this.snapshots.length - 1; i > 0; i--) {
+      if (this.snapshots[i].text !== this.snapshots[i - 1].text) { stableSince = this.snapshots[i].ts; break; }
+      stableSince = this.snapshots[i - 1].ts;
+    }
+    return (now - stableSince) >= ms;
+  }
+  isComplete(diff, snap) {
+    if (this.hasErrorSignal(snap)) return { done: true, reason: 'error' };
+    if (this.hasCopySignal(snap) && this.textStableFor(800)) return { done: true, reason: 'copy+stable' };
+    if (diff && diff.stable && this.textStableFor(this.settleMs)) return { done: true, reason: 'stable' };
+    return { done: false };
+  }
+}
+
+class ResponseExtractor {
+  extract(snap, prevSnap) {
+    // Prefer largest newly-grown text block that is visible
+    const candidates = snap.nodes.filter(n => n.visible && n.textLen > 20 && n.textLen < 20000);
+    // Sort by text length descending
+    candidates.sort((a, b) => b.textLen - a.textLen);
+    // Find candidate whose text wasn't in prev snapshot (new content)
+    if (prevSnap) {
+      for (const c of candidates) {
+        if (!prevSnap.text.includes(c.text.slice(0, 60))) return c.text;
+      }
+    }
+    if (candidates[0]) return candidates[0].text;
+    // Fallback: raw snapshot text minus header noise
+    let t = snap.text || '';
+    t = t.replace(/^Gemini said\s*/i, '').replace(/Show code\s*/i, '').trim();
+    return t;
+  }
+}
+
 // Universal waitForElement — MutationObserver + immediate check + timeout
 // Pattern from crawl4ai: check immediately, then observe until found or timeout
 function waitForElement(selector, timeout = 30000) {
@@ -120,35 +249,90 @@ function waitForElement(selector, timeout = 30000) {
   });
 }
 
-// Universal observeResponse — waits for completion signal (copy button)
-// then returns response text. Uses crawl4ai waitForElement pattern.
+// Broad observeResponse — DOM-diff polling, works across Gemini/Claude/DeepSeek etc.
+// Falls back to narrow selector if provided for speed.
 async function observeResponse(config = {}) {
   const {
-    responseSelector = 'response-container:last-child',
-    completionSelector = 'response-container:last-child button[aria-label="Copy"]',
-    errorSelectors = ["[role='alert']", "[class*='error']", "[class*=' Error ']"],
+    responseSelector = 'response-container',
+    responseSelectorStrategy = 'last',
+    errorSelectors = ["[role='alert']", "[class*='error']"],
     settleMs = 3000,
-    timeoutMs = 60000
+    timeoutMs = 60000,
+    pollMs = 600
   } = config;
 
-  // Wait for response container to appear
-  const responseEl = await waitForElement(responseSelector, timeoutMs);
+  const reader = new DomReader();
+  const differ = new DomDiffer();
+  const heuristic = new CompletionHeuristic({ settleMs });
+  const extractor = new ResponseExtractor();
 
-  // Wait for completion signal (copy button)
-  await waitForElement(completionSelector, timeoutMs);
-
-  // Check for errors in response
-  for (const errSel of errorSelectors) {
-    const errEl = responseEl.querySelector(errSel);
-    if (errEl && errEl.innerText && errEl.innerText.trim()) {
-      throw new Error(`Gemini error: ${errEl.innerText.trim()}`);
-    }
+  function resolveNarrowEl() {
+    const all = document.querySelectorAll(responseSelector);
+    if (all.length === 0) return null;
+    return responseSelectorStrategy === 'last' ? all[all.length - 1] : all[0];
   }
 
-  // Settling delay to ensure all content is rendered
-  await new Promise(r => setTimeout(r, settleMs));
+  // Baseline snapshot before streaming
+  let prevSnap = reader.snapshot();
+  heuristic.push(prevSnap);
+  const deadline = Date.now() + timeoutMs;
+  let lastDiff = null;
 
-  return responseEl.innerText.trim();
+  console.log('[Timepass] broad observeResponse start, baseline textLen', prevSnap.textLen, 'visible', prevSnap.stats.visible);
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, pollMs));
+    const snap = reader.snapshot();
+    const diff = differ.diff(prevSnap, snap);
+    heuristic.push(snap);
+    lastDiff = diff;
+
+    console.log('[Timepass] poll textLen', snap.textLen, 'delta', diff.textDelta, 'added', diff.added, 'changed', diff.changed, 'layout', diff.layoutShifts);
+
+    // Fast-path: narrow selector + copy button if available
+    const narrowEl = resolveNarrowEl();
+    if (narrowEl) {
+      const visibleCopy = document.querySelectorAll('button[aria-label="Copy"], button[aria-label*="Copy"], [data-test-id*="copy"]');
+      const hasVisibleCopy = Array.from(visibleCopy).some(b => b.offsetWidth || b.offsetHeight);
+      if (hasVisibleCopy) {
+        const fresh = resolveNarrowEl();
+        if (fresh && fresh.innerText && fresh.innerText.trim().length > 10) {
+          await new Promise(r => setTimeout(r, Math.min(settleMs, 800)));
+          let t = (fresh.textContent || fresh.innerText || '').trim().replace(/^Gemini said\s*/i, '').trim();
+          if (t.length > 5) { console.log('[Timepass] narrow fast-path hit, len', t.length); return t; }
+        }
+      }
+    }
+
+    const c = heuristic.isComplete(diff, snap);
+    if (c.done) {
+      console.log('[Timepass] broad completion reason', c.reason);
+      // Check narrow errors first
+      const fresh = resolveNarrowEl();
+      if (fresh) {
+        for (const sel of errorSelectors) {
+          const e = fresh.querySelector(sel);
+          if (e && e.innerText && e.innerText.trim()) throw new Error('Gemini error: ' + e.innerText.trim());
+        }
+      }
+      if (c.reason === 'error') throw new Error('Response error detected');
+      await new Promise(r => setTimeout(r, 500));
+      const finalSnap = reader.snapshot();
+      return extractor.extract(finalSnap, prevSnap);
+    }
+    prevSnap = snap;
+  }
+  // Timeout: return best effort
+  console.log('[Timepass] broad observe timeout, returning extractor fallback');
+  const finalSnap = reader.snapshot();
+  const fallback = extractor.extract(finalSnap, null);
+  if (fallback && fallback.length > 10) return fallback;
+  const narrow = resolveNarrowEl();
+  if (narrow) {
+    let t = (narrow.textContent || narrow.innerText || '').trim().replace(/^Gemini said\s*/i, '').trim();
+    if (t) return t;
+  }
+  throw new Error('Timeout waiting for response completion');
 }
 
 // Multi-tier DOM element selector
@@ -196,9 +380,12 @@ function simulateTyping(element, text) {
 // Find the Gemini "Send" button using the same tiered selectors as click_send
 function findSendButton() {
   const selectors = [
+    'gem-icon-button.send-button',
+    'gem-icon-button.send-button button',
+    '.send-button',
+    '.send-button button',
     'button[aria-label*="Send"]',
     'button[aria-label*="send"]',
-    'button.send-button',
     'button[mattooltip*="Send"]',
     'button[aria-label*="Submit"]',
     'button[aria-label*="Generate"]'
