@@ -184,10 +184,38 @@ function startResponseStream(id) {
   ];
 
   function findResponseEl() {
-    for (const sel of RESPONSE_SELECTORS) {
-      const el = document.querySelector(sel);
-      if (el) return el;
+    const candidates = [];
+    const push = (sel) => {
+      try {
+        document.querySelectorAll(sel).forEach((e) => candidates.push(e));
+      } catch (_e) { /* ignore bad selector */ }
+    };
+    push("model-response");
+    push("[class*='model-response']");
+    push(".markdown");
+    push("[class*='response']");
+    push("[class*='message-content']");
+    push("[class*='conversation']");
+
+    let best = null;
+    let bestLen = -1;
+    const summary = [];
+    for (const el of candidates) {
+      if (!el.isConnected) continue;
+      const cls = typeof el.className === "string" ? el.className : "";
+      // Skip text-to-speech / hidden containers that never hold the answer.
+      if (cls.includes("tts")) continue;
+      let display = "";
+      try { display = getComputedStyle(el).display; } catch (_e) { display = ""; }
+      if (display === "none") continue;
+      const len = (el.innerText || "").trim().length;
+      summary.push("<" + (el.tagName || "?") + "> cls=" + cls.slice(0, 40) + " len=" + len);
+      if (len > bestLen) { bestLen = len; best = el; }
     }
+    if (summary.length) {
+      console.log("[Timepass] response candidates: " + summary.join(" | "));
+    }
+    if (best) return best;
     // Fallback: the most recently added message container in the conversation
     const messages = document.querySelectorAll("[class*='message']");
     if (messages.length) return messages[messages.length - 1];
