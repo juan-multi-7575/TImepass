@@ -166,6 +166,95 @@ function selectHistory(target) {
   return { success: false, error: "History item not found: " + (title || url || "(no target)") };
 }
 
+// Stream the latest Gemini model response back to the server.
+// Posts {type:"stream_delta", id, delta, accumulatedText} on each change and a
+// debounced {type:"turn_complete", id, text, chatId} once the response settles.
+// (The server's ExtensionDriver relays only stream_delta / turn_complete /
+// extension_log, so those exact type names MUST be used.)
+function startResponseStream(id) {
+  console.log("[Timepass] startResponseStream id=" + id);
+  const RESPONSE_SELECTORS = [
+    "model-response",
+    "[class*='model-response']",
+    ".response-content",
+    ".markdown",
+    "[class*='response']",
+    "[class*='message-content']",
+    "message-content"
+  ];
+
+  function findResponseEl() {
+    for (const sel of RESPONSE_SELECTORS) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    // Fallback: the most recently added message container in the conversation
+    const messages = document.querySelectorAll("[class*='message']");
+    if (messages.length) return messages[messages.length - 1];
+    return null;
+  }
+
+  if (window.__timepass_activeMutationObserver) {
+    window.__timepass_activeMutationObserver.disconnect();
+    window.__timepass_activeMutationObserver = null;
+  }
+
+  let lastText = "";
+  let settleTimer = null;
+
+  function emit(text) {
+    if (!text || text === lastText) return;
+    lastText = text;
+    chrome.runtime.sendMessage({
+      type: "stream_delta",
+      id: id,
+      delta: text,
+      accumulatedText: text
+    });
+  }
+
+  function finish(text) {
+    console.log("[Timepass] turn_complete id=" + id + " len=" + (text || lastText || "").length);
+    chrome.runtime.sendMessage({
+      type: "turn_complete",
+      id: id,
+      text: text || lastText,
+      chatId: window.location.href
+    });
+  }
+
+  const observer = new MutationObserver(() => {
+    const el = findResponseEl();
+    if (!el || !el.isConnected) return;
+    const text = el.innerText || "";
+    emit(text);
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => {
+      observer.disconnect();
+      window.__timepass_activeMutationObserver = null;
+      finish(lastText);
+    }, 1200);
+  });
+
+  // Poll briefly for the response element (it renders after Send is clicked).
+  let attempts = 0;
+  const poll = setInterval(() => {
+    const el = findResponseEl();
+    if (el) {
+      clearInterval(poll);
+      observer.observe(el, { childList: true, characterData: true, subtree: true });
+      window.__timepass_activeMutationObserver = observer;
+      console.log("[Timepass] response element found: <" + (el.tagName || "?") + "> cls=" + (typeof el.className === "string" ? el.className.slice(0, 60) : ""));
+      const initial = el.innerText || "";
+      if (initial) emit(initial);
+    } else if (++attempts > 40) {
+      clearInterval(poll);
+      console.warn("[Timepass] response element never found; finishing stream");
+      finish(lastText);
+    }
+  }, 200);
+}
+
 // Chrome message handler (registered only once per page load)
 if (!window.__timepass_listener_registered) {
   window.__timepass_listener_registered = true;
@@ -187,8 +276,15 @@ if (!window.__timepass_listener_registered) {
       }
       simulateTyping(editor, text).then(() => {
         const btn = findSendButton();
-        if (btn) btn.click();
+        if (btn) {
+          console.log("[Timepass] clicking send button");
+          btn.click();
+        } else {
+          console.warn("[Timepass] send button NOT found after typing");
+        }
         sendResponse({ success: true });
+        // Begin streaming the model response back to the server.
+        startResponseStream(message.id);
       }).catch((err) => {
         sendResponse({ success: false, error: err.message });
       });
@@ -236,53 +332,8 @@ if (!window.__timepass_listener_registered) {
     }
 
     if (action === "stream_response") {
-      const selectors = [
-        ".response-content",
-        ".markdown",
-        "[class*='response']",
-        "[class*='model-response']",
-        "[class*='message-content']"
-      ];
-
-      let responseEl = null;
-      for (const sel of selectors) {
-        responseEl = document.querySelector(sel);
-        if (responseEl) break;
-      }
-
-      if (!responseEl) {
-        sendResponse({ success: false, error: "Response element not found" });
-        return;
-      }
-
-      // Set up MutationObserver to stream response
-      if (window.__timepass_activeMutationObserver) {
-        window.__timepass_activeMutationObserver.disconnect();
-      }
-
-      window.__timepass_activeMutationObserver = new MutationObserver((mutations) => {
-        for (const mutation of mutations) {
-          if (mutation.type === "childList" || mutation.type === "characterData") {
-            // Skip if element was removed from DOM
-            if (!responseEl.isConnected) {
-              window.__timepass_activeMutationObserver.disconnect();
-              return;
-            }
-            const text = responseEl.innerText;
-            chrome.runtime.sendMessage({
-              type: "response_chunk",
-              text: text
-            });
-          }
-        }
-      });
-
-      window.__timepass_activeMutationObserver.observe(responseEl, {
-        childList: true,
-        characterData: true,
-        subtree: true
-      });
-
+      // Delegate to the shared streaming helper (id-tagged, correct relay types).
+      startResponseStream(message.id);
       sendResponse({ success: true });
     }
 
