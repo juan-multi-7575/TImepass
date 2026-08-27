@@ -181,11 +181,17 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
       if (res !== undefined) {
         return res;
       }
+      // Listener returned undefined - it might be async (returned true)
+      // Wait and retry without re-injecting
+      if (i < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, 500));
+        continue;
+      }
       throw new Error("Receiving end returned undefined.");
     } catch (err) {
+      // Only re-inject on actual connection errors (no listener registered)
       const isConnectionError = err.message.includes("Could not establish connection") || 
-                                err.message.includes("Receiving end does not exist") || 
-                                err.message.includes("returned undefined");
+                                err.message.includes("Receiving end does not exist");
       
       if (isConnectionError && i === 0) {
         console.warn("[Timepass MV3] Content script unreachable. Re-injecting...");
@@ -203,7 +209,6 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
           files: ["content.js"]
         });
         
-        // No arbitrary setTimeout needed. The listener is registered.
         continue;
       }
       
