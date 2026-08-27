@@ -1,6 +1,8 @@
 // Timepass Gemini Extension - Background Service Worker
 
 let ws = null;
+let reconnectAttempts = 0;
+const MAX_BACKOFF_MS = 30000; // 30s max
 
 // Remote console log interceptor for background service worker
 (() => {
@@ -9,8 +11,21 @@ let ws = null;
   const originalError = console.error;
   const originalInfo = console.info;
 
+  const LOG_RATE_LIMIT = 20;
+  let logCount = 0;
+  let logWindowStart = Date.now();
+
   function sendRemoteLog(level, args) {
     try {
+      const now = Date.now();
+      if (now - logWindowStart >= 1000) {
+        logCount = 0;
+        logWindowStart = now;
+      }
+
+      if (logCount >= LOG_RATE_LIMIT) return;
+      logCount++;
+
       const text = args.map(arg => {
         if (typeof arg === "object") {
           try {
@@ -83,6 +98,7 @@ async function connectWebSocket() {
 
     socket.onopen = () => {
       console.log("[Timepass MV3] Connected to local timepass WebSocket server.");
+      reconnectAttempts = 0;
       chrome.storage.local.set({ status: "connected", lastConnected: Date.now() });
     };
 
@@ -268,7 +284,7 @@ async function handleServerMessage(message) {
     }
 
     if (action === "click_button") {
-      tab = await getOrCreateGeminiTab();
+      tab = await getOrCreateGeminiTab(payload?.url);
       const response = await sendMessageWithRetry(tab.id, { id, action, payload });
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ id, success: true, response }));
@@ -277,7 +293,7 @@ async function handleServerMessage(message) {
     }
 
     if (action === "file_upload") {
-      tab = await getOrCreateGeminiTab();
+      tab = await getOrCreateGeminiTab(payload?.url);
       const debuggee = { tabId: tab.id };
       let debuggerAttached = false;
       
@@ -515,7 +531,7 @@ async function handleServerMessage(message) {
     }
 
     if (action === "get_page_info") {
-      tab = await getOrCreateGeminiTab();
+      tab = await getOrCreateGeminiTab(payload?.url);
       const response = await sendMessageWithRetry(tab.id, { id, action, payload });
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ id, success: true, response }));
@@ -624,12 +640,15 @@ async function handleServerMessage(message) {
   }
 }
 
-// Keep-alive heartbeat & auto-reconnect (polls every 2s when disconnected)
+// Keep-alive heartbeat & auto-reconnect (with exponential backoff)
 setInterval(() => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+    reconnectAttempts = 0;
   } else {
-    connectWebSocket();
+    const backoffMs = Math.min(2000 * Math.pow(2, reconnectAttempts), MAX_BACKOFF_MS);
+    reconnectAttempts++;
+    setTimeout(() => connectWebSocket(), backoffMs);
   }
 }, 2000);
 

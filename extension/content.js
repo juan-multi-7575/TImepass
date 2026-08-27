@@ -4,14 +4,42 @@
 if (!window.__timepass_content_loaded) {
   window.__timepass_content_loaded = true;
 
-  // Remote console log interceptor
+  // Remote console log interceptor with rate limiting
   const originalLog = console.log;
   const originalWarn = console.warn;
   const originalError = console.error;
   const originalInfo = console.info;
 
+  const LOG_RATE_LIMIT = 20; // max forwarded logs per second
+  let logCount = 0;
+  let logWindowStart = Date.now();
+  let logDropped = 0;
+
   function sendRemoteLog(level, args) {
     try {
+      const now = Date.now();
+      if (now - logWindowStart >= 1000) {
+        if (logDropped > 0) {
+          try {
+            chrome.runtime.sendMessage({
+              type: "extension_log",
+              source: "content",
+              level: "warn",
+              text: "[Timepass] Dropped " + logDropped + " logs due to rate limit"
+            });
+          } catch (_) { /* ignore */ }
+        }
+        logCount = 0;
+        logDropped = 0;
+        logWindowStart = now;
+      }
+
+      if (logCount >= LOG_RATE_LIMIT) {
+        logDropped++;
+        return;
+      }
+      logCount++;
+
       const text = args.map(arg => {
         if (typeof arg === "object") {
           try {
@@ -236,6 +264,7 @@ function startResponseStream(id) {
 
   let lastText = "";
   let settleTimer = null;
+  let lastMutationTime = 0;
 
   function emit(text) {
     if (!text || text === lastText) return;
@@ -259,6 +288,10 @@ function startResponseStream(id) {
   }
 
   const observer = new MutationObserver(() => {
+    const now = Date.now();
+    if (now - lastMutationTime < 100) return; // throttle to ~10/sec
+    lastMutationTime = now;
+
     const el = findResponseEl();
     if (!el || !el.isConnected) return;
     const text = el.innerText || "";
@@ -428,6 +461,7 @@ function serializeSubtree(rootSelector, opts = {}) {
       tag: el.tagName?.toLowerCase() || "",
       className: el.className || "",
       attributes: {},
+      children: [],
       visible: el.offsetParent !== null || el.tagName === "BODY",
       inViewport: isElementInViewport(el),
       rect: el.getBoundingClientRect ? {
