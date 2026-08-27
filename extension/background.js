@@ -173,48 +173,67 @@ async function ensureTabGroup(tabId) {
   }
 }
 
+// Actions whose content-script handler returns `true` and resolves asynchronously
+// via sendResponse (e.g. inject_and_send awaits simulateTyping). For these we must
+// send the message ONCE and await the async response — retrying on `undefined` would
+// re-dispatch the action and spawn duplicate DOM operations (e.g. double typing).
+const ASYNC_ACTIONS = new Set([
+  "type_prompt",
+  "inject_and_send",
+  "click_send",
+  "stream_response"
+]);
+
 // Helper to send message to tab with retry while content.js initializes
 async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
+  const isAsync = ASYNC_ACTIONS.has(message && message.action);
+
   for (let i = 0; i < maxRetries; i++) {
     try {
       const res = await chrome.tabs.sendMessage(tabId, message);
       if (res !== undefined) {
         return res;
       }
-      // Listener returned undefined - it might be async (returned true)
-      // Wait briefly and retry once more, but don't re-inject for async responses
-      // Re-injection would close the message channel and cause the error:
-      // "A listener indicated an asynchronous response by returning true, 
-      // but the message channel closed before a response was received"
-      if (i < maxRetries - 1) {
+      // Listener returned undefined. For async actions the response is delivered via
+      // sendResponse on the still-open channel, so `chrome.tabs.sendMessage` already
+      // resolved with the real value — reaching here means no handler responded.
+      // Wait briefly (in case the listener is still initializing on first attempts)
+      // but never re-dispatch an async action.
+      if (i < maxRetries - 1 && !isAsync) {
         await new Promise(r => setTimeout(r, 300));
         continue;
       }
-      throw new Error("Receiving end returned undefined after " + maxRetries + " retries.");
+      // Final attempt (or async action): return a structured failure instead of throwing,
+      // so the server relay reports a clean error rather than an undefined-retry crash.
+      return {
+        success: false,
+        error: "Content script returned no response for action: " + (message && message.action)
+      };
     } catch (err) {
       // Only re-inject on actual connection errors (no listener registered)
-      const isConnectionError = err.message.includes("Could not establish connection") || 
-                                err.message.includes("Receiving end does not exist");
-      
+      const isConnectionError = err.message.includes("Could not establish connection") ||
+                                err.message.includes("Receiving end does not exist") ||
+                                err.message.includes("message channel closed");
+
       if (isConnectionError && i === 0) {
         console.warn("[Timepass MV3] Content script unreachable. Re-injecting...");
-        
+
         // Reset the guard so re-injection registers the listener
         await chrome.scripting.executeScript({
           target: { tabId },
           func: () => { window.__timepass_listener_registered = false; }
         }).catch(() => { /* Ignore if context is completely gone */ });
 
-        // Re-inject the script. The promise resolves ONLY after 
+        // Re-inject the script. The promise resolves ONLY after
         // the script (and its top-level onMessage listener) has executed.
         await chrome.scripting.executeScript({
           target: { tabId },
           files: ["content.js"]
         }).catch(() => { /* Ignore if re-injection fails */ });
-        
+
         continue;
       }
-      
+
       throw err;
     }
   }

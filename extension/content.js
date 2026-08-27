@@ -111,12 +111,99 @@ function simulateTyping(element, text) {
   });
 }
 
+// Find the Gemini "Send" button using the same tiered selectors as click_send
+function findSendButton() {
+  const selectors = [
+    'button[aria-label*="Send"]',
+    'button[aria-label*="send"]',
+    'button.send-button',
+    'button[mattooltip*="Send"]',
+    'button[aria-label*="Submit"]',
+    'button[aria-label*="Generate"]'
+  ];
+
+  for (const sel of selectors) {
+    const btn = document.querySelector(sel);
+    if (btn) return btn;
+  }
+  return null;
+}
+
+// Read conversation history from the Gemini sidebar (best-effort, resilient)
+function readHistory() {
+  try {
+    const items = [];
+    const seen = new Set();
+    const links = document.querySelectorAll('a[href*="/app/"]');
+    for (const link of links) {
+      const url = link.href;
+      const title = (link.textContent || "").trim();
+      if (!url || seen.has(url)) continue;
+      // Skip the "new chat" / compose link (usually no title or the home route)
+      if (!title && url.endsWith("/app")) continue;
+      seen.add(url);
+      items.push({ title: title || url, url });
+    }
+    return { success: true, history: items };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// Select a conversation from the Gemini sidebar by title or url
+function selectHistory(target) {
+  const title = (target && target.title || "").trim().toLowerCase();
+  const url = target && target.url;
+  const links = document.querySelectorAll('a[href*="/app/"]');
+  for (const link of links) {
+    const matchTitle = title && (link.textContent || "").trim().toLowerCase().includes(title);
+    const matchUrl = url && link.href === url;
+    if (matchTitle || matchUrl) {
+      link.click();
+      return { success: true, url: link.href };
+    }
+  }
+  return { success: false, error: "History item not found: " + (title || url || "(no target)") };
+}
+
 // Chrome message handler (registered only once per page load)
 if (!window.__timepass_listener_registered) {
   window.__timepass_listener_registered = true;
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const { action, payload } = message || {};
+
+    // Live path used by the adapter: type the prompt then click Send.
+    if (action === "inject_and_send") {
+      const text = (payload && (payload.prompt || payload.text)) || "";
+      const editor = findInputEditor();
+      if (!editor) {
+        sendResponse({ success: false, error: "Input editor not found" });
+        return;
+      }
+      if (!text) {
+        sendResponse({ success: false, error: "Missing payload.prompt" });
+        return;
+      }
+      simulateTyping(editor, text).then(() => {
+        const btn = findSendButton();
+        if (btn) btn.click();
+        sendResponse({ success: true });
+      }).catch((err) => {
+        sendResponse({ success: false, error: err.message });
+      });
+      return true; // keep message channel open for async
+    }
+
+    if (action === "read_history") {
+      sendResponse(readHistory());
+      return;
+    }
+
+    if (action === "select_history") {
+      sendResponse(selectHistory(payload));
+      return;
+    }
 
     if (action === "type_prompt") {
       const editor = findInputEditor();
@@ -137,20 +224,7 @@ if (!window.__timepass_listener_registered) {
     }
 
     if (action === "click_send") {
-      const selectors = [
-        'button[aria-label*="Send"]',
-        'button[aria-label*="send"]',
-        'button.send-button',
-        'button[mattooltip*="Send"]',
-        'button[aria-label*="Submit"]',
-        'button[aria-label*="Generate"]'
-      ];
-
-      let button = null;
-      for (const sel of selectors) {
-        button = document.querySelector(sel);
-        if (button) break;
-      }
+      const button = findSendButton();
 
       if (!button) {
         sendResponse({ success: false, error: "Send button not found" });
@@ -247,6 +321,10 @@ if (!window.__timepass_listener_registered) {
 
     // Sync handlers returned sendResponse above; return undefined (no return)
     // to close the channel cleanly.
+    // Fallback: any unhandled action must still respond with an object so the
+    // background's sendMessageWithRetry never sees `undefined` (which would
+    // otherwise be treated as a pending async response and trigger retries).
+    sendResponse({ success: false, error: "Unknown action: " + action });
     return;
   });
 }
