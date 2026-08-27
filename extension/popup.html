@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Timepass Gemini Status</title>
+  <style>
+    body {
+      width: 240px;
+      font-family: system-ui, -apple-system, sans-serif;
+      padding: 12px;
+      margin: 0;
+      background: #0f172a;
+      color: #f8fafc;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .badge {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ef4444;
+    }
+    .badge.active {
+      background: #22c55e;
+    }
+    .status-text {
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .info {
+      font-size: 11px;
+      color: #94a3b8;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div id="badge" class="badge"></div>
+    <div id="status" class="status-text">Disconnected</div>
+  </div>
+  <div class="info">
+    Timepass Gemini Extension is active. It connects to the local WebSocket server at <code>ws://127.0.0.1:9876</code> and manages Gemini tabs in the <strong>🤖 Timepass Gemini</strong> Tab Group.
+  </div>
+
+  <script>
+    chrome.storage.local.get(["status"], (result) => {
+      const badge = document.getElementById("badge");
+      const status = document.getElementById("status");
+      if (result.status === "connected") {
+        badge.classList.add("active");
+        status.textContent = "Connected to timepass";
+      } else if (result.status === "offline") {
+        badge.classList.remove("active");
+        status.textContent = "Server Offline (start CLI)";
+      } else {
+        badge.classList.remove("active");
+        status.textContent = "Standby";
+      }
+    });
+  </script>
+</body>
+</html>

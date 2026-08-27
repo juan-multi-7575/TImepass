@@ -1,0 +1,4 @@
+{
+  "ok": false,
+  "error": "Selector matched nothing: input[type=\"file\"]"
+}

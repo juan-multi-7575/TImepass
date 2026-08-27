@@ -1,0 +1,1 @@
+{"version":3,"file":"response-streamer.d.ts","sourceRoot":"","sources":["../../src/components/response-streamer.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,gBAAgB,EAAE,MAAM,0BAA0B,CAAC;AAE5D,qBAAa,uBAAwB,YAAW,gBAAgB;IAC9D,IAAI,SAAsB;IAC1B,SAAS,WAIP;IAEF,QAAQ,CAAC,IAAI,GAAE,QAAQ,GAAG,OAAkB,GAAG,OAAO,GAAG,IAAI;IAQvD,OAAO,IAAI,OAAO,CAAC,OAAO,CAAC;CAGlC"}
