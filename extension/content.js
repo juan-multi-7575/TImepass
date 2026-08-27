@@ -203,11 +203,11 @@ function startResponseStream(id) {
     for (const el of candidates) {
       if (!el.isConnected) continue;
       const cls = typeof el.className === "string" ? el.className : "";
-      // Skip text-to-speech / hidden containers that never hold the answer.
+      // Skip containers that never hold the visible answer.
       if (cls.includes("tts")) continue;
-      let display = "inline";
-      try { display = getComputedStyle(el).display; } catch (_e) { /* ignore */ }
-      if (display === "none") continue;
+      if (cls.includes("visually-hidden") || cls.includes("sr-only")) continue;
+      // Skip completely invisible elements (display:none, zero-size, etc.)
+      if (el.offsetHeight === 0 && el.offsetWidth === 0) continue;
       const len = (el.innerText || "").trim().length;
       summary.push("<" + (el.tagName || "?") + "> cls=" + cls.slice(0, 40) + " len=" + len);
       if (len > bestLen) { bestLen = len; best = el; }
@@ -216,9 +216,16 @@ function startResponseStream(id) {
       console.log("[Timepass] response candidates: " + summary.join(" | "));
     }
     if (best) return best;
-    // Fallback: the most recently added message container in the conversation
+    // Fallback: the most recently added VISIBLE message container in the conversation.
+    // Exclude visually-hidden / sr-only accessibility nodes (e.g. cdk-describedby-message-container).
     const messages = document.querySelectorAll("[class*='message']");
-    if (messages.length) return messages[messages.length - 1];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const el = messages[i];
+      const cls = typeof el.className === "string" ? el.className : "";
+      if (cls.includes("visually-hidden") || cls.includes("sr-only")) continue;
+      if (el.offsetHeight === 0 && el.offsetWidth === 0) continue;
+      return el;
+    }
     return null;
   }
 
@@ -264,8 +271,10 @@ function startResponseStream(id) {
     }, 1200);
   });
 
-  // Poll briefly for the response element (it renders after Send is clicked).
+  // Poll for the response element (Gemini renders it after Send; image analysis
+  // can take several seconds, so we poll for up to 20 seconds).
   let attempts = 0;
+  const MAX_POLL = 100; // 100 * 200ms = 20s
   const poll = setInterval(() => {
     const el = findResponseEl();
     if (el) {
@@ -275,7 +284,7 @@ function startResponseStream(id) {
       console.log("[Timepass] response element found: <" + (el.tagName || "?") + "> cls=" + (typeof el.className === "string" ? el.className.slice(0, 60) : ""));
       const initial = el.innerText || "";
       if (initial) emit(initial);
-    } else if (++attempts > 40) {
+    } else if (++attempts >= MAX_POLL) {
       clearInterval(poll);
       console.warn("[Timepass] response element never found; finishing stream");
       finish(lastText);
