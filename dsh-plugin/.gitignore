@@ -1,0 +1,4 @@
+# Dev-only links to the harness packages, created by the scratch driver
+# setup documented in README.md. Never committed.
+node_modules/
+scratch/.tmp/

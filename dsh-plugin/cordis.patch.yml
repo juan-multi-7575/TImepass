@@ -1,0 +1,17 @@
+# timepass Gemini bridge.
+#
+# One plugin row: it registers the `gemini_*` tools and the `/gemini` command.
+# Every setting has a schema default, so this row needs no config block. A
+# profile that wants different values overrides the row by id and restates the
+# whole config, for example in the profile's own cordis.patch.yml:
+#
+#   - id: timepass-gemini
+#     config:
+#       model: 'pro'
+#       timeoutMs: 180000
+#       enableCookieTools: false
+#
+# See README.md for the full field list.
+- insert:
+    - id: timepass-gemini
+      name: 'dsh-timepass-gemini'

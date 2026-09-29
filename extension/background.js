@@ -45,8 +45,8 @@ const MAX_BACKOFF_MS = 30000; // 30s max
           text: text
         }));
       }
-    } catch (e) {
-      // Ignore
+    } catch {
+      // Ignore remote log failures
     }
   }
 
@@ -86,7 +86,7 @@ async function connectWebSocket() {
     const timer = setTimeout(() => controller.abort(), 800);
     await fetch(`http://127.0.0.1:${WS_PORT}`, { mode: "no-cors", signal: controller.signal });
     clearTimeout(timer);
-  } catch (err) {
+  } catch {
     // Server is offline; set status silently without throwing extension error
     chrome.storage.local.set({ status: "offline" });
     return;
@@ -124,7 +124,8 @@ async function connectWebSocket() {
 
     ws = socket;
   } catch (err) {
-    chrome.storage.local.set({ status: "disconnected" });
+    const errMsg = err && err.message ? err.message : String(err);
+    chrome.storage.local.set({ status: "disconnected", lastError: errMsg });
     ws = null;
   }
 }
@@ -242,9 +243,11 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
 
         // Re-inject the script. The promise resolves ONLY after
         // the script (and its top-level onMessage listener) has executed.
+        // answer-root.js must come first: content.js reads its helper off the
+        // global, and injecting content.js alone would silently lose it.
         await chrome.scripting.executeScript({
           target: { tabId },
-          files: ["content.js"]
+          files: ["answer-root.js", "content.js"]
         }).catch(() => { /* Ignore if re-injection fails */ });
 
         continue;
@@ -285,6 +288,13 @@ async function handleServerMessage(message) {
 
     if (action === "click_button") {
       tab = await getOrCreateGeminiTab(payload?.url);
+      const { selector } = payload || {};
+      if (!selector || typeof selector !== "string" || !selector.trim()) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ id, success: false, error: "Invalid payload.selector" }));
+        }
+        return;
+      }
       const response = await sendMessageWithRetry(tab.id, { id, action, payload });
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ id, success: true, response }));
@@ -521,7 +531,7 @@ async function handleServerMessage(message) {
       } catch (err) {
         // Detach on error
         if (debuggerAttached) {
-          try { await chrome.debugger.detach({ tabId: tab.id }); } catch (_e) { /* ignore */ }
+          try { await chrome.debugger.detach({ tabId: tab.id }); } catch { /* ignore */ }
         }
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ id, success: true, response: { success: false, error: err.message } }));
@@ -624,6 +634,13 @@ async function handleServerMessage(message) {
 
     tab = await getOrCreateGeminiTab(payload?.url);
 
+    // Arm the freeze watchdog for the live ask path. Only a confirmed freeze
+    // (no heartbeat at all) triggers a reload, so a slow but healthy long
+    // generation is never interrupted.
+    if (action === "inject_and_send") {
+      activeTurn = { id, tabId: tab.id, startedAt: Date.now(), lastBeatAt: Date.now(), handled: false };
+    }
+
     // Send action to content script in the Gemini tab with retry
     const response = await sendMessageWithRetry(tab.id, { id, action, payload });
 
@@ -652,8 +669,30 @@ setInterval(() => {
   }
 }, 2000);
 
+// --- Freeze recovery --------------------------------------------------------
+// A tab whose main thread is blocked cannot heal itself: the content script
+// that would notice is frozen along with the page. So the watchdog lives here,
+// in a separate JS context that stays responsive, and decides from silence.
+// Silence is the signal: a slow-but-alive page keeps beating, a frozen one
+// cannot. Only a confirmed freeze reloads, so a long healthy answer is never
+// interrupted.
+const FREEZE_RELOAD_MS = 20000;
+
+/** The turn currently being observed, or null when idle. */
+let activeTurn = null;
+
 // Relays messages from content script back to server
-chrome.runtime.onMessage.addListener((message, sender) => {
+chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
+  // Liveness beacon: kept in the worker, never forwarded. A page that is slow
+  // but alive keeps sending these; a tab with a blocked main thread goes
+  // silent, and that silence is what the watchdog acts on.
+  if (message.type === "turn_heartbeat") {
+    if (activeTurn) activeTurn.lastBeatAt = Date.now();
+    return;
+  }
+  if (message.type === "turn_complete") {
+    activeTurn = null;
+  }
   if (message.type === "stream_delta" || message.type === "turn_complete" || message.type === "extension_log") {
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
@@ -664,6 +703,50 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     }
   }
 });
+
+async function handleFreezeWatchdog() {
+  if (!activeTurn || activeTurn.handled) return;
+  if (Date.now() - activeTurn.lastBeatAt < FREEZE_RELOAD_MS) return;
+
+  const turn = activeTurn;
+  turn.handled = true;
+  const silentFor = Date.now() - turn.lastBeatAt;
+  console.warn(`[Timepass MV3] Gemini tab silent for ${silentFor}ms with a turn in flight; reloading to recover the saved response.`);
+
+  try {
+    await chrome.tabs.reload(turn.tabId);
+    await waitTabLoaded(turn.tabId);
+    // The conversation is re-rendered from the server, so the answer that was
+    // already produced is recovered rather than re-asked.
+    const res = await sendMessageWithRetry(turn.tabId, {
+      action: "recover_last_response",
+      payload: { timeoutMs: 45000 }
+    });
+    if (!res || res.success !== true) {
+      throw new Error((res && res.error) || "recovery returned no response");
+    }
+    activeTurn = null;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        id: turn.id,
+        success: true,
+        response: { success: true, recovered: true, text: res.text, chatId: res.chatId }
+      }));
+    }
+  } catch (err) {
+    console.error("[Timepass MV3] Freeze recovery failed:", err);
+    activeTurn = null;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        id: turn.id,
+        success: false,
+        error: `Tab froze and the saved response could not be recovered: ${err.message}`
+      }));
+    }
+  }
+}
+
+setInterval(() => { handleFreezeWatchdog().catch(() => {}); }, 2000);
 
 // Connect on worker start
 connectWebSocket();

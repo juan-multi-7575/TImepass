@@ -22,7 +22,7 @@
   "content_scripts": [
     {
       "matches": ["https://gemini.google.com/*"],
-      "js": ["content.js"],
+      "js": ["answer-root.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

@@ -1,0 +1,38 @@
+{
+  "name": "dsh-timepass-gemini",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness plugin exposing the timepass Gemini browser bridge (Chrome MV3 extension + WebSocket driver) as model-facing tools",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./tools": "./src/tools.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/**/!(*.test).js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "private": true,
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "timepass",
+    "gemini",
+    "browser-automation"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  }
+}
