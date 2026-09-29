@@ -14,7 +14,10 @@
     "cli": "tsx src/cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint extension/ --ext .js"
+    "lint": "eslint extension/ --ext .js",
+    "dsh:scratch": "node dsh-plugin/scratch/driver.mjs",
+    "dsh:scratch:fake": "node dsh-plugin/scratch/driver.mjs --fake",
+    "dsh:check": "tsc -p dsh-plugin/tsconfig.json"
   },
   "keywords": [
     "gemini",

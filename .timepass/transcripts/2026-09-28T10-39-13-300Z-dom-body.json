@@ -1,0 +1,995 @@
+{
+  "tag": "body",
+  "className": "ssr-nav-open enable-lm-loading-animation lr26 enable-lm-fast-follows chrome-context-v39 enable-mweb-header-mavatar hide-ogb-signed-out-mweb light-theme lm-component-theme enable-lm-locale-line-height enable-lm-mobile-tokens enable-lm-non-latin-bold-weight enable-lm-spacing-tokens sidenav-mavatar-migration-enabled theme-host variable-context",
+  "attributes": {
+    "class": "ssr-nav-open enable-lm-loading-animation lr26 enable-lm-fast-follows chrome-context-v39 enable-mweb-header-mavatar hide-ogb-signed-out-mweb light-theme lm-component-theme enable-lm-locale-line-height enable-lm-mobile-tokens enable-lm-non-latin-bold-weight enable-lm-spacing-tokens sidenav-mavatar-migration-enabled theme-host variable-context",
+    "ngcm": "",
+    "jslog": "283462;track:impression;BardVeMetadataKey:W1tudWxsLG51bGwsbnVsbCxudWxsLG51bGwsbnVsbCxudWxsLDFdXQ=="
+  },
+  "children": [
+    {
+      "tag": "div",
+      "className": "",
+      "attributes": {
+        "style": "display: none"
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "script",
+      "className": "",
+      "attributes": {
+        "nonce": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "script",
+      "className": "",
+      "attributes": {
+        "nonce": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "boqOnegoogleliteOgbOneGoogleBar",
+      "attributes": {
+        "class": "boqOnegoogleliteOgbOneGoogleBar"
+      },
+      "children": [
+        {
+          "tag": "div",
+          "className": "gb_Ra gb_Nd gb_Jb gb_e gb_cb gb_md",
+          "attributes": {
+            "class": "gb_Ra gb_Nd gb_Jb gb_e gb_cb gb_md",
+            "id": "gb",
+            "style": "background-color: transparent;"
+          },
+          "children": [
+            {
+              "tag": "div",
+              "className": "gb_be gb_Fb gb_2d",
+              "attributes": {
+                "class": "gb_be gb_Fb gb_2d",
+                "ng-non-bindable": "",
+                "data-ogsr-up": ""
+              },
+              "children": [
+                {
+                  "tag": "div",
+                  "className": "gb_Md",
+                  "attributes": {
+                    "class": "gb_Md"
+                  },
+                  "visible": true,
+                  "rect": {
+                    "x": 1512,
+                    "y": 18.5,
+                    "width": 8,
+                    "height": 27
+                  }
+                },
+                {
+                  "tag": "div",
+                  "className": "",
+                  "attributes": {
+                    "style": "overflow: hidden; position: absolute; top: 0px; visibility: hidden; width: 370px; z-index: 991; height: 0px; margin-top: 57px; transition: height 0.3s ease-in-out; right: 0px; margin-right: 4px; max-width: calc(100dvw - 20px);",
+                    "aria-hidden": "true"
+                  },
+                  "visible": true,
+                  "rect": {
+                    "x": 1150,
+                    "y": 65,
+                    "width": 370,
+                    "height": 0
+                  }
+                },
+                {
+                  "tag": "div",
+                  "className": "",
+                  "attributes": {
+                    "style": "overflow: hidden; position: absolute; top: 0px; visibility: hidden; width: 424px; z-index: 991; height: 0px; margin-top: 57px; right: 0px; margin-right: 4px;"
+                  },
+                  "visible": true,
+                  "rect": {
+                    "x": 1096,
+                    "y": 65,
+                    "width": 424,
+                    "height": 0
+                  }
+                },
+                {
+                  "tag": "div",
+                  "className": "",
+                  "attributes": {
+                    "style": "overflow: hidden; position: absolute; top: 0px; visibility: hidden; width: 420px; z-index: 991; height: 280px; margin-top: 70px; right: 0px; margin-right: 25px;"
+                  },
+                  "visible": true,
+                  "rect": {
+                    "x": 1079,
+                    "y": 78,
+                    "width": 420,
+                    "height": 280
+                  }
+                }
+              ],
+              "visible": true,
+              "rect": {
+                "x": 1512,
+                "y": 8,
+                "width": 12,
+                "height": 48
+              }
+            }
+          ],
+          "visible": true,
+          "rect": {
+            "x": 1512,
+            "y": 8,
+            "width": 12,
+            "height": 48
+          }
+        }
+      ],
+      "visible": false,
+      "rect": {
+        "x": 1524,
+        "y": 8,
+        "width": 0,
+        "height": 48
+      }
+    },
+    {
+      "tag": "script",
+      "className": "",
+      "attributes": {
+        "nonce": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "noscript",
+      "className": "",
+      "attributes": {},
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "",
+      "attributes": {
+        "style": "display: none"
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "script",
+      "className": "",
+      "attributes": {
+        "id": "bard-initial-data",
+        "data-payload": "{\"KEsM4\":false,\"YGMNid\":true,\"ZXlM5e\":false,\"Qd7BXc\":false,\"cPpIQe\":false}",
+        "nonce": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "script",
+      "className": "",
+      "attributes": {
+        "nonce": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "chat-app-orchestrator",
+      "className": "",
+      "attributes": {
+        "id": "app-root",
+        "ng-version": "0.0.0-PLACEHOLDER",
+        "_nghost-ng-c2332002910": ""
+      },
+      "children": [
+        {
+          "tag": "chat-app",
+          "className": "side-nav-open enable-lr26-markdown-styling lr26 enable-print-overrides ng-tns-c2029667303-0",
+          "attributes": {
+            "_ngcontent-ng-c2332002910": "",
+            "_nghost-ng-c2029667303": "",
+            "class": "side-nav-open enable-lr26-markdown-styling lr26 enable-print-overrides ng-tns-c2029667303-0",
+            "style": "--internal-bar-offset: 0px; --announcement-banner-padding-top: 0px;"
+          },
+          "children": [
+            {
+              "tag": "main",
+              "className": "chat-app",
+              "attributes": {
+                "_ngcontent-ng-c2029667303": "",
+                "class": "chat-app"
+              },
+              "children": [
+                {
+                  "tag": "div",
+                  "className": "side-nav-menu-button hide-on-print with-pill-ui",
+                  "attributes": {
+                    "_ngcontent-ng-c2029667303": "",
+                    "data-test-id": "chat-app",
+                    "class": "side-nav-menu-button hide-on-print with-pill-ui"
+                  },
+                  "visible": false,
+                  "rect": {
+                    "x": 8,
+                    "y": 8,
+                    "width": 101.01250457763672,
+                    "height": 40
+                  }
+                },
+                {
+                  "tag": "top-bar-actions",
+                  "className": "hide-on-print ng-tns-c2029667303-0 side-nav-expanded lr26 lm-canvas-styling shrink-to-fit luminous-top-bar ng-star-inserted",
+                  "attributes": {
+                    "_ngcontent-ng-c2029667303": "",
+                    "class": "hide-on-print ng-tns-c2029667303-0 side-nav-expanded lr26 lm-canvas-styling shrink-to-fit luminous-top-bar ng-star-inserted",
+                    "_nghost-ng-c1224572559": "",
+                    "style": "--ogb-width: 0px;"
+                  },
+                  "visible": false,
+                  "rect": {
+                    "x": 1367.5750732421875,
+                    "y": 8,
+                    "width": 156.4250030517578,
+                    "height": 48
+                  }
+                },
+                {
+                  "tag": "side-navigation-v2",
+                  "className": "content enable-mweb-nav-improvements lr26",
+                  "attributes": {
+                    "_ngcontent-ng-c2029667303": "",
+                    "class": "content enable-mweb-nav-improvements lr26",
+                    "_nghost-ng-c1475054199": ""
+                  },
+                  "visible": false,
+                  "rect": {
+                    "x": 0,
+                    "y": 0,
+                    "width": 0,
+                    "height": 0
+                  }
+                }
+              ],
+              "visible": true,
+              "rect": {
+                "x": 0,
+                "y": 0,
+                "width": 1536,
+                "height": 689.6000366210938
+              }
+            }
+          ],
+          "visible": true,
+          "rect": {
+            "x": 0,
+            "y": 0,
+            "width": 1536,
+            "height": 689.6000366210938
+          }
+        }
+      ],
+      "visible": true,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 1536,
+        "height": 689.6000366210938
+      }
+    },
+    {
+      "tag": "script",
+      "className": "",
+      "attributes": {
+        "src": "https://gemini.gstatic.com/_/mss/boq-bard-web/_/js/k=boq-bard-web.BardChatUi.en_GB._HH_PP0vIsM.2018.O/am=aSAADd8BbN89gAK-CAcDEmCCThDADgAAAIAQ/d=1/excm=_b/ed=1/dg=0/br=1/wt=2/ujg=1/rs=AL3bBk2qmFCmqhnE47hbfd5fLBXNbu8huA/ee=DGWCxb:CgYiQ;EmZ2Bf:zr1jrb;NJ1rfe:yGfSdd;Pjplud:PoEs9b;QGR0gd:Mlhmy;ScI3Yc:e7Hzgb;UYRIEb:HzTAQc;YIZmRd:A1yn5d;cEt90b:ws9Tlc;dIoSBb:SpsfSb;dowIGb:ebZ3mb;eBAeSb:zbML3c;iFQyKf:vfuNJf;oGtAuc:sOXFj;qQEoOc:KUM7Z;qddgKe:xQtZb;wNp4Gc:k56rsf;wR5FRb:siKnQd;yxTchf:KUM7Z/dti=1/m=_b?wli=BardChatUi.bTxD1DbBtzo.libheifWasm.O%3A%3B",
+        "id": "base-js",
+        "nonce": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "script",
+      "className": "",
+      "attributes": {
+        "nonce": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "",
+      "attributes": {
+        "ng-non-bindable": ""
+      },
+      "children": [],
+      "visible": true,
+      "rect": {
+        "x": 0,
+        "y": 689.6000366210938,
+        "width": 1536,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "gb_Q",
+      "attributes": {
+        "class": "gb_Q",
+        "ng-non-bindable": ""
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "cdk-live-announcer-element cdk-visually-hidden",
+      "attributes": {
+        "class": "cdk-live-announcer-element cdk-visually-hidden",
+        "aria-atomic": "true",
+        "aria-live": "polite",
+        "id": "cdk-live-announcer-0"
+      },
+      "children": [],
+      "visible": true,
+      "rect": {
+        "x": -1,
+        "y": -1,
+        "width": 1,
+        "height": 1
+      }
+    },
+    {
+      "tag": "iframe",
+      "className": "",
+      "attributes": {
+        "src": "/_/bscframe",
+        "style": "display: none;"
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "gb_Z",
+      "attributes": {
+        "class": "gb_Z",
+        "ng-non-bindable": ""
+      },
+      "children": [
+        {
+          "tag": "div",
+          "className": "gb_2c",
+          "attributes": {
+            "class": "gb_2c"
+          },
+          "children": [
+            {
+              "tag": "div",
+              "className": "",
+              "attributes": {},
+              "children": [],
+              "visible": false,
+              "rect": {
+                "x": 0,
+                "y": 0,
+                "width": 0,
+                "height": 0
+              }
+            },
+            {
+              "tag": "div",
+              "className": "gb_g",
+              "attributes": {
+                "class": "gb_g"
+              },
+              "children": [],
+              "visible": false,
+              "rect": {
+                "x": 0,
+                "y": 0,
+                "width": 0,
+                "height": 0
+              }
+            },
+            {
+              "tag": "div",
+              "className": "",
+              "attributes": {},
+              "children": [],
+              "visible": false,
+              "rect": {
+                "x": 0,
+                "y": 0,
+                "width": 0,
+                "height": 0
+              }
+            },
+            {
+              "tag": "div",
+              "className": "gb_1c",
+              "attributes": {
+                "class": "gb_1c"
+              },
+              "children": [],
+              "visible": false,
+              "rect": {
+                "x": 0,
+                "y": 0,
+                "width": 0,
+                "height": 0
+              }
+            }
+          ],
+          "visible": false,
+          "rect": {
+            "x": 0,
+            "y": 0,
+            "width": 0,
+            "height": 0
+          }
+        }
+      ],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "cdk-describedby-message-container cdk-visually-hidden",
+      "attributes": {
+        "class": "cdk-describedby-message-container cdk-visually-hidden",
+        "style": "visibility: hidden;"
+      },
+      "children": [
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-2",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": -1,
+            "width": 1,
+            "height": 20
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-3",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 19,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-4",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 37.400001525878906,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-5",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 55.79999923706055,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-6",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 74.20000457763672,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-7",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 92.5999984741211,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-8",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 111,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-9",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 129.40000915527344,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-10",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 147.8000030517578,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-11",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 166.1999969482422,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-12",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 184.60000610351562,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-13",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 203,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-14",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 221.40000915527344,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-15",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 239.8000030517578,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-16",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 258.20001220703125,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-17",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 276.6000061035156,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-18",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 295,
+            "width": 1,
+            "height": 20
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-19",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 315,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-20",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 333.3999938964844,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        },
+        {
+          "tag": "div",
+          "className": "",
+          "attributes": {
+            "id": "cdk-describedby-message-ng-1-21",
+            "role": "tooltip"
+          },
+          "children": [],
+          "visible": true,
+          "rect": {
+            "x": -1,
+            "y": 351.8000183105469,
+            "width": 1,
+            "height": 18.399999618530273
+          }
+        }
+      ],
+      "visible": true,
+      "rect": {
+        "x": -1,
+        "y": -1,
+        "width": 1,
+        "height": 1
+      }
+    },
+    {
+      "tag": "iframe",
+      "className": "",
+      "attributes": {
+        "id": "hfcr",
+        "src": "https://accounts.google.com/RotateCookiesPage?og_pid=658&rot=3&origin=https%3A%2F%2Fgemini.google.com&exp_id=0",
+        "style": "display: none;"
+      },
+      "children": [],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    },
+    {
+      "tag": "div",
+      "className": "cdk-overlay-container",
+      "attributes": {
+        "class": "cdk-overlay-container"
+      },
+      "children": [
+        {
+          "tag": "div",
+          "className": "cdk-overlay-connected-position-bounding-box",
+          "attributes": {
+            "class": "cdk-overlay-connected-position-bounding-box",
+            "dir": "ltr",
+            "style": "inset: 0px auto auto 0px; height: 100%; width: 100%;"
+          },
+          "children": [
+            {
+              "tag": "div",
+              "className": "cdk-overlay-pane",
+              "attributes": {
+                "id": "cdk-overlay-0",
+                "class": "cdk-overlay-pane",
+                "style": "bottom: 97.8px; left: 602px; transform: translateY(-8px);"
+              },
+              "children": [
+                {
+                  "tag": "div",
+                  "className": "cdk-visually-hidden cdk-focus-trap-anchor",
+                  "attributes": {
+                    "tabindex": "0",
+                    "class": "cdk-visually-hidden cdk-focus-trap-anchor",
+                    "aria-hidden": "true"
+                  },
+                  "visible": true,
+                  "rect": {
+                    "x": 601,
+                    "y": 326.01251220703125,
+                    "width": 1,
+                    "height": 1
+                  }
+                },
+                {
+                  "tag": "mat-card",
+                  "className": "mat-mdc-card mdc-card card-container lm-menu-theme ng-star-inserted opening-upward",
+                  "attributes": {
+                    "_ngcontent-ng-c917612563": "",
+                    "cdkfocusregionstart": "",
+                    "cdktrapfocus": "",
+                    "lmmenutheme": "",
+                    "tabindex": "-1",
+                    "data-test-id": "card-container",
+                    "class": "mat-mdc-card mdc-card card-container lm-menu-theme ng-star-inserted opening-upward",
+                    "jslog": "300143;track:generic_click,impression"
+                  },
+                  "visible": true,
+                  "rect": {
+                    "x": 602,
+                    "y": 327.01251220703125,
+                    "width": 249,
+                    "height": 248.8000030517578
+                  }
+                },
+                {
+                  "tag": "div",
+                  "className": "cdk-visually-hidden cdk-focus-trap-anchor",
+                  "attributes": {
+                    "tabindex": "0",
+                    "class": "cdk-visually-hidden cdk-focus-trap-anchor",
+                    "aria-hidden": "true"
+                  },
+                  "visible": true,
+                  "rect": {
+                    "x": 601,
+                    "y": 326.01251220703125,
+                    "width": 1,
+                    "height": 1
+                  }
+                }
+              ],
+              "visible": true,
+              "rect": {
+                "x": 602,
+                "y": 327.01251220703125,
+                "width": 249,
+                "height": 256.8000183105469
+              }
+            }
+          ],
+          "visible": true,
+          "rect": {
+            "x": 0,
+            "y": 0,
+            "width": 1536,
+            "height": 689.6000366210938
+          }
+        }
+      ],
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 1536,
+        "height": 689.6000366210938
+      }
+    }
+  ],
+  "visible": true,
+  "rect": {
+    "x": 0,
+    "y": 0,
+    "width": 1536,
+    "height": 689.6000366210938
+  }
+}

@@ -1,0 +1,18 @@
+Shor’s algorithm, developed by Peter Shor in 1994, is a quantum algorithm that solves the prime factorization problem in polynomial time—specifically in O((logN)3) operations for an n-bit integer N.Classically, the best known general-purpose factoring algorithm is the General Number Field Sieve (GNFS), which runs in sub-exponential time:exp(O((logN)1/3(loglogN)2/3))This gap between sub-exponential classical complexity and polynomial quantum complexity is what threatens modern public-key cryptography (such as RSA), which relies on the hardness of factoring large integers N=p⋅q.1. Reduction of Factoring to Order-FindingFactoring N reduces to finding the order (or period) of an element in the multiplicative group of integers modulo N, denoted (Z/NZ)×.Number Theory FoundationsCoprimality & Group: Choose an integer a uniformly at random such that 1<a<N. Compute gcd(a,N) using the classical Euclidean algorithm. If gcd(a,N)>1, we have already found a non-trivial factor and we are done. Otherwise, a∈(Z/NZ)×.Euler's Totient Theorem: Since gcd(a,N)=1, Euler's theorem guarantees that aϕ(N)≡1(modN), where ϕ(N) is Euler's totient function.Order (r): The order of a modulo N is defined as the smallest positive integer r such that:ar≡1(modN)Factoring via r: Suppose we can find r, and r happens to be even. Then:ar−1≡0(modN)⟹(ar/2−1)(ar/2+1)≡0(modN)This means N divides the product (ar/2−1)(ar/2+1). As long as ar/2≡−1(modN), neither factor alone is a multiple of N. Therefore, calculating:gcd(ar/2−1,N)andgcd(ar/2+1,N)yields non-trivial factors of N.Theorem: If N=p1e1​​⋯pkek​​ is an odd composite with at least two distinct prime factors, and a is picked uniformly at random from (Z/NZ)×, then r is even and ar/2≡−1(modN) with probability P≥1−21−k≥21​.Finding r classically requires evaluating modular exponentiations across exponentially many values, taking time exponential in logN. Shor's algorithm delegates finding r to a quantum circuit.2. The Step-by-Step AlgorithmTo find r for a given a and N, select an integer Q=2m such that N2≤Q<2N2.Classical Pre-processing:
+  1. Check if N is even or a prime power p^k.
+  2. Pick random a < N.
+  3. Compute gcd(a, N). If > 1, return factor.
+
+Quantum Circuit Setup:
+  [|0⟩^⊗m] ----[ H^⊗m ]----(●)----[ QFT^\dagger ]----[ Measure Register 1 ] -> y
+                             |
+  [|0...01⟩] --------------[ U_a ]------------------[ Measure Register 2 ] (optional)
+                             |
+                   U_a|x⟩|y⟩ = |x⟩|y ⊕ (a^x mod N)⟩
+
+Classical Post-processing:
+  4. Compute y / Q.
+  5. Use Continued Fractions to find candidate r.
+  6. Verify a^r ≡ 1 (mod N).
+  7. If r is even and a^(r/2) ≢ -1 (mod N), factors are gcd(a^(r/2) ± 1, N).
+Quantum Circuit MechanicsThe quantum register consists of two parts:Register 1 (Control): m qubits initialized to ∣0⟩⊗m, storing states from 0 to Q−1.Register 2 (Target): n=⌈log2​N⌉ qubits initialized to ∣1⟩=∣0…01⟩.Step 1: Initialization & SuperpositionApply Hadamard gates H⊗m to Register 1 to create an equal superposition of all integers x∈{0,1,…,Q−1}:∣ψ1​⟩=Q​1​x=0∑Q−1​∣x⟩∣1⟩Step 2: Modular ExponentiationApply the unitary transformation Ua​, defined by Ua​∣x⟩∣y⟩=∣x⟩∣(y⋅ax)(modN)⟩:∣ψ2​⟩=Q​1​x=0∑Q−1​∣x⟩∣axmodN⟩Note: In practice, axmodN is implemented efficiently via repeated squaring, requiring O(logQ)=O(logN) controlled modular multiplications rather than Q sequential steps.Step 3: Measuring Register 2 (Conceptual Step)Measuring Register 2 is computationally optional (or can be done implicitly at the end), but analyzing

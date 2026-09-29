@@ -67,4 +67,16 @@ module.exports = [
       'prefer-promise-reject-errors': 'error',
     },
   },
+  {
+    // Co-located vitest specs are ES modules even though the extension files
+    // they cover are classic scripts.
+    files: ['extension/**/*.test.js'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
 ];

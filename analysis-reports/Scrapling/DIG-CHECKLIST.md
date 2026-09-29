@@ -1,0 +1,8 @@
+# Deep-Dig Checklist: Scrapling
+
+Subagents MUST append one line per dig here (do not overwrite others lines, only append).
+Format: `- [x] <agent-name> | <feature> | <files dug> | <one-line finding>`
+
+- [x] agent-adaptive-selection | adaptive/auto-heal element selection | scrapling/parser.py, scrapling/core/storage.py, scrapling/core/utils/_utils.py, scrapling/engines/toolbelt/custom.py | save->retrieve->relocate cycle persists element fingerprints to domain-scoped SQLite and re-locates on selector miss via SequenceMatcher-weighted tree scan.
+- [x] agent-stealthy-fetcher | StealthyFetcher/Camoufox-Patchright stealth fetching | scrapling/fetchers/stealth_chrome.py, scrapling/engines/_browsers/_stealth.py, _base.py, _validators.py, _types.py, scrapling/engines/constants.py, toolbelt/{convertor,navigation,proxy_rotation,fingerprints}.py | Since v0.3.13 the engine is Patchright-patched Chromium (Camoufox dropped); StealthySession launches a persistent context with ~60 stealth args + fixed fingerprint, and the fetch loop runs an optional 3-attempt Cloudflare Turnstile solver before ResponseFactory builds the Selector-based Response.
+- [x] agent-response-parsers | response object + parser layer | scrapling/parser.py, scrapling/engines/toolbelt/{custom,convertor}.py, scrapling/core/{translator,mixins,custom_types}.py, scrapling/fetchers/requests.py, scrapling/engines/_browsers/_controllers.py | Response(Selector) wraps an lxml HTMLParser-parsed tree; all CSS (incl. ::text/::attr pseudo-elements) is translated to XPath by a cssselect HTMLTranslator subclass (lru_cached), RRERP Shape: ResponseFactory adapts Playwright sync/async + curl_cffi responses with redirect-history folding, and text/regex/json conveniences live on TextHandler (a str subclass).
