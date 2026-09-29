@@ -7,9 +7,24 @@ import { GeminiAdapter } from './adapter/gemini-adapter.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/**
+ * Announce a timed-out answer. A fragment printed under a normal heading is
+ * indistinguishable from a finished one, so this goes to stderr and says
+ * plainly that the text is unfinished.
+ */
+function warnIfPartial(response: { text: string; partial?: boolean }): void {
+  if (!response || response.partial !== true) return;
+  console.error(
+    '\n[timepass CLI] WARNING: this answer is INCOMPLETE.\n' +
+    `[timepass CLI] The wait timed out with only ${response.text.length} characters captured;\n` +
+    '[timepass CLI] the rest of the response never rendered. Do not treat it as the full answer.\n' +
+    '[timepass CLI] Re-run with a longer --timeout to collect the remainder.\n'
+  );
+}
+
 function showUsage() {
   console.log(`
-Usage: timepass <command> [argument] [--model <flash|pro|thinking>] [--new-chat]
+Usage: timepass <command> [argument] [--model <modelId>] [--new-chat]
 
 Commands:
   ask              Send prompt to Gemini and print the full response
@@ -50,7 +65,7 @@ async function main() {
   const command = args[0];
   const argument = args[1];
 
-  let model: 'flash' | 'pro' | 'thinking' | undefined;
+  let model: string | undefined;
   const modelIdx = args.indexOf('--model');
   if (modelIdx !== -1 && args[modelIdx + 1]) {
     model = args[modelIdx + 1] as any;
@@ -231,6 +246,7 @@ async function main() {
       }
       console.log(`[timepass CLI] Uploading ${filePaths.length} file(s) to Gemini...`);
       const response = await adapter.askWithFiles(query, filePaths, { model, newChat });
+      warnIfPartial(response);
       console.log(`\nResponse:\n${response.text}`);
       const outputPath = path.resolve(__dirname, '../response.md');
       fs.writeFileSync(outputPath, response.text, 'utf-8');
@@ -243,7 +259,7 @@ async function main() {
 
       if (command === 'stream') {
         console.log(`[timepass CLI] Sending prompt: "${prompt}"\n---`);
-        const response = await adapter.ask(prompt, {
+        const response = await adapter.stream(prompt, {
           model,
           newChat,
           onChunk: (chunk) => {
@@ -251,11 +267,13 @@ async function main() {
           }
         });
         console.log('\n--- Done.');
+        warnIfPartial(response);
         finalResponseText = response.text;
         images = response.images || [];
       } else if (command === 'ask') {
         console.log(`[timepass CLI] Sending prompt: "${prompt}"...`);
         const response = await adapter.ask(prompt, { model, newChat });
+        warnIfPartial(response);
         console.log(`\nResponse:\n${response.text}`);
         finalResponseText = response.text;
         images = response.images || [];
@@ -285,19 +303,3 @@ async function main() {
 }
 
 main();
-
-function getMimeType(filePath: string): string {
-  const ext = path.extname(filePath).toLowerCase();
-  switch (ext) {
-    case '.png': return 'image/png';
-    case '.jpg':
-    case '.jpeg': return 'image/jpeg';
-    case '.gif': return 'image/gif';
-    case '.webp': return 'image/webp';
-    case '.pdf': return 'application/pdf';
-    case '.txt': return 'text/plain';
-    case '.csv': return 'text/csv';
-    case '.json': return 'application/json';
-    default: return 'application/octet-stream';
-  }
-}

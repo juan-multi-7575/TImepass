@@ -22,6 +22,10 @@ export class CdpDriver implements BrowserDriver {
     // CDP event binding
   }
 
+  offEvent(event: string, callback: (data: any) => void): void {
+    // CDP event unbinding
+  }
+
   async close(): Promise<void> {
     console.log('[CdpDriver] Disconnecting CDP session.');
   }

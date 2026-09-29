@@ -9,7 +9,28 @@ build/
 .idea/
 .vscode/
 
-# Logs
+# Project-specific directories to untrack
+.opencode/
+.timepass/
+analysis-reports/
+analysis-repos/
+docs/
+
+# --- CRITICAL: live session credentials and generated artifacts ---
+# `cookies-get` dumps *every* cookie for the domain, including
+# __Secure-1PSID / __Secure-1PSCT session tokens. The next run would commit
+# live Google credentials. Treat these files as secrets and never track them.
+cookies.json
+cookies-restore.json
+
+# Generated outputs from CLI commands
+response.md
+screenshot.png
+history.json
+dom-tree.json
+test-upload.jpg
+
+# Runtime diagnostics
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -18,6 +39,7 @@ yarn-error.log*
 # Test coverage
 coverage/
 .nyc_output/
+.vitest/
 
 # OS files
 .DS_Store
@@ -36,12 +58,3 @@ Thumbs.db
 # Temporary files
 .tmp-*
 *.md~
-
-# Package lock (optional - uncomment if you want to ignore it)
-# package-lock.json
-
-# Vitest
-.vitest/
-
-# Extension files (optional - uncomment if you want to ignore build artifacts)
-# extension/

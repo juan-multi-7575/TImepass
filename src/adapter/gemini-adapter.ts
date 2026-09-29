@@ -4,43 +4,43 @@ import { fileURLToPath } from 'url';
 
 import { BrowserDriver } from '../driver/driver.interface.js';
 import { ExtensionDriver } from '../driver/extension-driver.js';
-import { CdpDriver } from '../driver/cdp-driver.js';
 import { ComponentRegistry } from '../components/registry.js';
 import { PromptInputHandler } from '../components/prompt-input.js';
 import { SendButtonHandler } from '../components/send-button.js';
 import { ModelPickerHandler } from '../components/model-picker.js';
 import { ImageUploaderHandler } from '../components/image-uploader.js';
 import { ResponseStreamerHandler } from '../components/response-streamer.js';
-import { RetryHandler } from './retry-handler.js';
 import { GeminiOptions, GeminiResponse, StreamChunk } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/**
+ * Headroom above the page-side budget before the adapter abandons a stream.
+ * Must exceed the driver's own grace so the driver's more specific error wins
+ * the race; see ACTION_GRACE_MS in extension-driver.ts.
+ */
+const STREAM_GRACE_MS = 20000;
+
 export class GeminiAdapter {
   private driver: BrowserDriver;
   private registry: ComponentRegistry;
-  private retryHandler: RetryHandler;
   private defaultOptions: GeminiOptions;
 
   constructor(options: GeminiOptions = {}) {
+    const merged = { ...options };
+    const model = merged.model ?? merged.modelId ?? 'flash';
+
     this.defaultOptions = {
       driver: 'extension',
-      model: 'flash',
+      model,
       timeoutMs: 60000,
-      maxRetries: 2,
-      ...options
+      ...merged
     };
 
-    if (this.defaultOptions.driver === 'cdp') {
-      this.driver = new CdpDriver();
-    } else {
-      this.driver = new ExtensionDriver();
-    }
-
+    this.driver = new ExtensionDriver();
     this.registry = new ComponentRegistry();
     this.registerDefaultComponents();
-    this.retryHandler = new RetryHandler(this.defaultOptions.maxRetries);
   }
 
   private registerDefaultComponents(): void {
@@ -61,8 +61,9 @@ export class GeminiAdapter {
 
   async ask(prompt: string, options?: GeminiOptions): Promise<GeminiResponse> {
     const opts = { ...this.defaultOptions, ...options };
+    const model = opts.model ?? opts.modelId ?? 'flash';
 
-    const payload: any = { prompt, model: opts.model, timeoutMs: opts.timeoutMs };
+    const payload: any = { prompt, model, timeoutMs: opts.timeoutMs };
     if (opts.newChat) {
       payload.url = 'https://gemini.google.com/app';
     }
@@ -72,22 +73,124 @@ export class GeminiAdapter {
       turnComplete: boolean;
       text?: string;
       chatId?: string;
+      partial?: boolean;
       error?: string;
     }>({
       action: 'inject_and_send',
-      payload
+      payload,
+      // The driver honours the *top-level* budget, so a caller's timeoutMs has
+      // to ride up here — nesting it inside `payload` left it unread and every
+      // ask was silently capped at 60s regardless of what was requested.
+      timeoutMs: opts.timeoutMs,
     });
 
     if (res.success && res.data && res.data.success && res.data.turnComplete) {
       return {
         chatId: res.data.chatId || 'https://gemini.google.com/app',
         text: res.data.text || '',
-        images: []
+        images: [],
+        partial: res.data.partial === true
       };
     }
 
     const errMsg = res.error || (res.data && res.data.error) || 'Failed to get Gemini response.';
     throw new Error(errMsg);
+  }
+
+  async stream(prompt: string, options?: GeminiOptions): Promise<GeminiResponse> {
+    const opts = { ...this.defaultOptions, ...options };
+    const model = opts.model ?? opts.modelId ?? 'flash';
+
+    const payload: any = { prompt, model, timeoutMs: opts.timeoutMs };
+    if (opts.newChat) {
+      payload.url = 'https://gemini.google.com/app';
+    }
+
+    let fullText = '';
+    let chatId = 'https://gemini.google.com/app';
+    let completed = false;
+
+    const actionPromise = this.driver.executeAction<{
+      success: boolean;
+      turnComplete: boolean;
+      text?: string;
+      chatId?: string;
+      error?: string;
+      recovered?: boolean;
+      partial?: boolean;
+    }>({
+      action: 'inject_and_send',
+      payload,
+      timeoutMs: opts.timeoutMs,
+    });
+
+    return new Promise((resolve, reject) => {
+      const finish = (response: GeminiResponse) => {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timeout);
+        cleanup();
+        resolve(response);
+      };
+      const fail = (error: Error) => {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timeout);
+        cleanup();
+        reject(error);
+      };
+      // Last resort only. The page spends `timeoutMs` deciding, the driver's
+      // action reply gets grace on top of that, and this sits above both — so
+      // the informative failure is the one that normally surfaces, and this
+      // only fires when the whole bridge has genuinely gone quiet.
+      const timeout = setTimeout(() => {
+        fail(new Error('Stream timed out waiting for completion.'));
+      }, (opts.timeoutMs ?? 60000) + STREAM_GRACE_MS);
+
+      const cleanup = () => {
+        this.driver.offEvent('stream_delta', handleDelta);
+        this.driver.offEvent('turn_complete', handleComplete);
+      };
+
+      const handleDelta = (msg: any) => {
+        const delta = typeof msg.delta === 'string' ? msg.delta : '';
+        if (!delta) return;
+        fullText += delta;
+        if (opts.onChunk) opts.onChunk({ delta, accumulatedText: fullText });
+      };
+
+      const handleComplete = (msg: any) => {
+        const text = typeof msg.text === 'string' && msg.text ? msg.text : fullText;
+        if (msg.chatId) chatId = msg.chatId;
+        finish({ chatId, text, images: [], recovered: msg.recovered === true, partial: msg.partial === true });
+      };
+
+      this.driver.onEvent('stream_delta', handleDelta);
+      this.driver.onEvent('turn_complete', handleComplete);
+
+      actionPromise.then((res) => {
+        if (!res.success || !res.data?.success) {
+          fail(new Error(res.error || res.data?.error || 'Failed to stream Gemini response.'));
+          return;
+        }
+        // The action reply carries the authoritative final text, so it settles
+        // the stream on its own. Gating this on `fullText` meant a turn whose
+        // deltas were all dropped threw away the complete answer it was
+        // holding and then hung until the timeout. `finish` is already
+        // idempotent, so losing the race to `handleComplete` is harmless.
+        if (res.data?.text) {
+          finish({
+            chatId: res.data.chatId || chatId,
+            text: res.data.text,
+            images: [],
+            recovered: res.data.recovered === true,
+            partial: res.data.partial === true
+          });
+        }
+      }).catch((err) => {
+        fail(err instanceof Error ? err : new Error(String(err)));
+      });
+    });
   }
 
   async listHistory(): Promise<{ title: string; url: string }[]> {
@@ -133,7 +236,9 @@ export class GeminiAdapter {
     });
 
     if (res.success && res.data) {
-      return res.data.result;
+      // The content script wraps the outline in `result`; a build that replies
+      // with the outline itself must not come back as undefined.
+      return res.data.result ?? res.data;
     }
     throw new Error(res.error || 'Failed to dump DOM subtree.');
   }

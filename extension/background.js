@@ -3,6 +3,11 @@
 let ws = null;
 let reconnectAttempts = 0;
 const MAX_BACKOFF_MS = 30000; // 30s max
+// The 2s poll schedules a new, independent timer on every tick while offline.
+// Without this handle the backoff saturates at 30s within five ticks while new
+// 30s timers keep being queued, so the extension opens a pile of orphaned
+// sockets. Clear before scheduling so only one reconnect is ever in flight.
+let reconnectTimer = null;
 
 // Remote console log interceptor for background service worker
 (() => {
@@ -141,8 +146,14 @@ async function getOrCreateGeminiTab(targetUrl = "https://gemini.google.com/app")
     tab = await chrome.tabs.create({ url: targetUrl, active: false, pinned: true });
     tab = await waitTabLoaded(tab.id);
   } else {
-    // If background tab was discarded by Chrome, reload it to awake content.js
-    if (tab.discarded || tab.status === "loading") {
+    // `--new-chat` asks for a fresh conversation, so navigate the existing tab
+    // to the app root instead of leaving it on the previous thread. Without
+    // this the flag is a silent no-op and prompts land in the old conversation.
+    if (targetUrl && tab.url !== targetUrl) {
+      await chrome.tabs.update(tab.id, { url: targetUrl });
+      tab = await waitTabLoaded(tab.id);
+    } else if (tab.discarded || tab.status === "loading") {
+      // If background tab was discarded by Chrome, reload it to awake content.js
       if (tab.discarded) {
         await chrome.tabs.reload(tab.id);
       }
@@ -662,10 +673,17 @@ setInterval(() => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
     reconnectAttempts = 0;
-  } else {
+  } else if (!reconnectTimer) {
+    // Backoff is computed per *attempt*, not per *tick*: otherwise every 2s
+    // poll while offline queues another overlapping timer and the extension
+    // opens a pile of orphaned sockets, each of which nulls the shared
+    // clientSocket on close and breaks the live one. Schedule at most one.
     const backoffMs = Math.min(2000 * Math.pow(2, reconnectAttempts), MAX_BACKOFF_MS);
     reconnectAttempts++;
-    setTimeout(() => connectWebSocket(), backoffMs);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectWebSocket();
+    }, backoffMs);
   }
 }, 2000);
 
@@ -730,7 +748,7 @@ async function handleFreezeWatchdog() {
       ws.send(JSON.stringify({
         id: turn.id,
         success: true,
-        response: { success: true, recovered: true, text: res.text, chatId: res.chatId }
+        response: { success: true, turnComplete: true, recovered: true, text: res.text, chatId: res.chatId }
       }));
     }
   } catch (err) {

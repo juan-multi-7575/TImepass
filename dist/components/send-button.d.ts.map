@@ -1,1 +1,0 @@
-{"version":3,"file":"send-button.d.ts","sourceRoot":"","sources":["../../src/components/send-button.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,gBAAgB,EAAE,MAAM,0BAA0B,CAAC;AAE5D,qBAAa,iBAAkB,YAAW,gBAAgB;IACxD,IAAI,SAAgB;IACpB,SAAS,WAKP;IAEF,QAAQ,CAAC,IAAI,GAAE,QAAQ,GAAG,OAAkB,GAAG,OAAO,GAAG,IAAI;IAQvD,OAAO,IAAI,OAAO,CAAC,OAAO,CAAC;CAOlC"}
