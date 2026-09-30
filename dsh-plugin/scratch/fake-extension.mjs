@@ -99,6 +99,14 @@ const RESPONSES = {
     const text = prompt.startsWith('LONG:') ? 'LONG ANSWER. ' + 'x'.repeat(20000) : 'Fake extension answer for: ' + prompt
     return { success: true, turnComplete: true, text, chatId: 'https://gemini.google.com/app/abc' }
   },
+  // The page-side re-read of a turn Gemini already saved. This is what the
+  // host falls back to when no reply ever reached the socket.
+  recover_last_response: () => ({
+    success: true,
+    recovered: true,
+    text: 'Saved conversation answer.',
+    chatId: 'https://gemini.google.com/app/abc',
+  }),
   'cookies:get': () => ({ cookies: [{ name: 'SID', value: 'secret', domain: 'gemini.google.com' }] }),
   'cookies:restore': () => ({ ok: true }),
 }
@@ -140,7 +148,32 @@ export function startFakeExtension(options = {}) {
       socket.send(JSON.stringify({ id: message?.id, success: false, error: 'Unknown action: ' + message?.action }))
       return
     }
+
+    // Two prompt prefixes exist so a turn that outlives the host's wait can be
+    // reproduced without a slow Gemini:
+    //   SLOW:<ms>:…  the answer arrives that many ms later — the late reply a
+    //                timed-out turn is supposed to be collected from
+    //   SILENT:…     no reply ever arrives — the socket loses the answer, so
+    //                only the saved conversation can supply it
+    const prompt = String(message?.payload?.prompt ?? '')
+    if (prompt.startsWith('SILENT:')) {
+      log('ignoring ' + message.action + ' (SILENT:)')
+      return
+    }
+    const slow = prompt.match(/^SLOW:(\d+):/)
+    const delayMs = slow ? Number(slow[1]) : 0
+
     answered += 1
+    const response = build(message.payload)
+    if (delayMs > 0) {
+      log('answering ' + message.action + ' after ' + delayMs + 'ms')
+      setTimeout(() => {
+        if (socket && socket.readyState === 1) {
+          socket.send(JSON.stringify({ id: message.id, success: true, response }))
+        }
+      }, delayMs)
+      return
+    }
     log('answering ' + message.action)
     socket.send(JSON.stringify({ id: message.id, success: true, response: build(message.payload) }))
   }

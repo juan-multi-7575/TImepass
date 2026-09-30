@@ -15,6 +15,21 @@ const ACTION_GRACE_MS = 15000;
 /** Budget assumed when a caller does not state one. */
 const DEFAULT_ACTION_BUDGET_MS = 60000;
 
+/**
+ * How long the answer to an abandoned action stays collectable after the host
+ * stopped waiting.
+ *
+ * Giving up on the *wait* is not the same as losing the work: the request is
+ * already in flight and Gemini has already done the reasoning, so a reply that
+ * lands late is a completed answer, not a failure. Retaining it long enough for
+ * a follow-up `collectLate` turns a total loss into a short second call.
+ */
+const LATE_RESPONSE_TTL_MS = 30 * 60 * 1000;
+
+/** Retained late replies and abandoned ids are both bounded; oldest goes first. */
+const MAX_LATE_RESPONSES = 20;
+const MAX_ABANDONED_IDS = 50;
+
 export class ExtensionDriver implements BrowserDriver {
   private wss: WebSocketServer | null = null;
   private clientSocket: WebSocket | null = null;
@@ -22,6 +37,12 @@ export class ExtensionDriver implements BrowserDriver {
   /** Handles for the per-action timeout timers, cleared on reply so no
    * completed action leaks a 75s timer (the MCP server has no process.exit). */
   private pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Actions the host gave up waiting for, keyed by id. An id stays here until
+   * its reply arrives (then it becomes a late response) or it ages out. */
+  private abandoned = new Map<string, { at: number; action: string }>();
+  /** Replies that arrived after their action was abandoned — the answers that
+   * used to be dropped on the floor the instant the timeout fired. */
+  private lateResponses = new Map<string, { at: number; action: string; result: ActionResult<any> }>();
   private eventListeners = new Map<string, ((data: any) => void)[]>();
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
@@ -44,6 +65,10 @@ export class ExtensionDriver implements BrowserDriver {
     'tab_switch',
     'tab_group_list',
     'click_button',
+    // Re-reads the answer Gemini already saved for the last turn, without
+    // re-asking. The freeze watchdog has always used this; exposing it lets a
+    // host-side collect recover a turn whose reply never reached the socket.
+    'recover_last_response',
     'get_page_info'
   ]);
 
@@ -73,43 +98,11 @@ export class ExtensionDriver implements BrowserDriver {
 
           ws.on('message', (data) => {
             try {
-              const msg = JSON.parse(data.toString());
-
-              if (msg.type === 'ping') return; // Ignore heartbeats
-
-              if (msg.type === 'extension_log') {
-                const source = msg.source === 'background' ? 'Background' : 'Content';
-                const prefix = `[Extension:${source}:${msg.level.toUpperCase()}]`;
-                if (msg.level === 'error') {
-                  console.error(`\x1b[31m${prefix} ${msg.text}\x1b[0m`);
-                } else if (msg.level === 'warn') {
-                  console.warn(`\x1b[33m${prefix} ${msg.text}\x1b[0m`);
-                } else {
-                  console.log(`\x1b[90m${prefix} ${msg.text}\x1b[0m`);
-                }
-                return;
-              }
-
-              if (msg.id && this.pendingRequests.has(msg.id)) {
-                const resolver = this.pendingRequests.get(msg.id)!;
-                this.pendingRequests.delete(msg.id);
-                const timer = this.pendingTimers.get(msg.id);
-                if (timer) {
-                  clearTimeout(timer);
-                  this.pendingTimers.delete(msg.id);
-                }
-                resolver({ success: msg.success !== false, data: msg.response, error: msg.error });
-                return;
-              }
-
-               if (msg.type) {
-                 const listeners = this.eventListeners.get(msg.type) || [];
-                 for (const fn of listeners) fn(msg);
-               }
-             } catch (err) {
-               console.error('[ExtensionDriver] Error handling WS message:', err);
-             }
-           });
+              this.handleMessage(JSON.parse(data.toString()));
+            } catch (err) {
+              console.error('[ExtensionDriver] Error handling WS message:', err);
+            }
+          });
 
            ws.on('close', () => {
              console.log('[ExtensionDriver] Chrome extension disconnected.');
@@ -160,8 +153,8 @@ export class ExtensionDriver implements BrowserDriver {
     // Honour the caller's budget instead of a fixed 60s. A caller that asks for
     // two minutes must not have the request abandoned at one, and one that asks
     // for ten seconds should not pin a slot for a minute.
-    const budget = typeof (payload as any).timeoutMs === 'number' && (payload as any).timeoutMs > 0
-      ? (payload as any).timeoutMs
+    const budget = typeof payload.timeoutMs === 'number' && payload.timeoutMs > 0
+      ? payload.timeoutMs
       : DEFAULT_ACTION_BUDGET_MS;
     const waitMs = budget + ACTION_GRACE_MS;
 
@@ -178,12 +171,122 @@ export class ExtensionDriver implements BrowserDriver {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
           this.pendingTimers.delete(id);
-          resolve({ success: false, error: `Action execution timed out after ${waitMs}ms waiting for extension.` });
+          // Giving up the *wait* is not losing the work: the request is already
+          // in flight. Remember the id so that if the extension answers after
+          // this point, the reply is kept rather than dropped for having no
+          // pending entry left to resolve against.
+          this.abandoned.set(id, { at: Date.now(), action: payload.action });
+          this.pruneRetained();
+          resolve({
+            success: false,
+            late: true,
+            id,
+            error: `Action execution timed out after ${waitMs}ms waiting for extension.`
+          });
         }
       }, waitMs);
 
       this.pendingTimers.set(id, timer);
     });
+  }
+
+  /**
+   * Take the answer to an action the host already abandoned, when the extension
+   * replied after the timeout. Returns null when nothing was retained, which is
+   * the caller's cue to fall back to re-reading the saved conversation.
+   */
+  async collectLate<T = unknown>(id?: string): Promise<ActionResult<T> | null> {
+    this.pruneRetained();
+    if (this.lateResponses.size === 0) return null;
+
+    let key = id;
+    if (key && !this.lateResponses.has(key)) return null; // An explicit id that was never retained.
+    if (!key) {
+      // Newest first: the answer to the turn that just timed out is the one a
+      // caller means by "collect the last one".
+      key = [...this.lateResponses.entries()]
+        .reduce((newest, entry) => (entry[1].at > this.lateResponses.get(newest)!.at ? entry[0] : newest),
+          [...this.lateResponses.keys()][0]);
+    }
+
+    const entry = this.lateResponses.get(key)!;
+    // One-shot: a second collect must not hand the same text to another caller
+    // as though it were a fresh response.
+    this.lateResponses.delete(key);
+    return entry.result as ActionResult<T>;
+  }
+
+  /**
+   * One inbound socket message. Split out of the socket callback so the routing
+   * rules — above all what happens to a reply whose request was given up on —
+   * can be exercised without a live server.
+   */
+  private handleMessage(msg: any): void {
+    if (msg.type === 'ping') return; // Ignore heartbeats
+
+    if (msg.type === 'extension_log') {
+      const source = msg.source === 'background' ? 'Background' : 'Content';
+      const prefix = `[Extension:${source}:${msg.level.toUpperCase()}]`;
+      if (msg.level === 'error') {
+        console.error(`\x1b[31m${prefix} ${msg.text}\x1b[0m`);
+      } else if (msg.level === 'warn') {
+        console.warn(`\x1b[33m${prefix} ${msg.text}\x1b[0m`);
+      } else {
+        console.log(`\x1b[90m${prefix} ${msg.text}\x1b[0m`);
+      }
+      return;
+    }
+
+    if (msg.id && this.pendingRequests.has(msg.id)) {
+      const resolver = this.pendingRequests.get(msg.id)!;
+      this.pendingRequests.delete(msg.id);
+      const timer = this.pendingTimers.get(msg.id);
+      if (timer) {
+        clearTimeout(timer);
+        this.pendingTimers.delete(msg.id);
+      }
+      resolver({ success: msg.success !== false, data: msg.response, error: msg.error, id: msg.id });
+      return;
+    }
+
+    // A reply for an action the host already gave up on. The id used to be
+    // deleted when the timeout fired, so a finished answer arriving here
+    // matched nothing and was dropped silently: the reasoning was already paid
+    // for, and thrown away.
+    if (msg.id && this.abandoned.has(msg.id)) {
+      const entry = this.abandoned.get(msg.id)!;
+      this.abandoned.delete(msg.id);
+      this.lateResponses.set(msg.id, {
+        at: Date.now(),
+        action: entry.action,
+        result: { success: msg.success !== false, data: msg.response, error: msg.error, id: msg.id, late: true }
+      });
+      this.pruneRetained();
+      return;
+    }
+
+    if (msg.type) {
+      const listeners = this.eventListeners.get(msg.type) || [];
+      for (const fn of listeners) fn(msg);
+    }
+  }
+
+  /** Drop retained entries that have aged out or exceeded their cap. */
+  private pruneRetained(): void {
+    const now = Date.now();
+    for (const [id, entry] of this.abandoned) {
+      if (now - entry.at > LATE_RESPONSE_TTL_MS) this.abandoned.delete(id);
+    }
+    for (const [id, entry] of this.lateResponses) {
+      if (now - entry.at > LATE_RESPONSE_TTL_MS) this.lateResponses.delete(id);
+    }
+    // Map iteration is insertion-ordered, so the first key is the oldest.
+    while (this.abandoned.size > MAX_ABANDONED_IDS) {
+      this.abandoned.delete(this.abandoned.keys().next().value as string);
+    }
+    while (this.lateResponses.size > MAX_LATE_RESPONSES) {
+      this.lateResponses.delete(this.lateResponses.keys().next().value as string);
+    }
   }
 
   onEvent(event: string, callback: (data: any) => void): void {

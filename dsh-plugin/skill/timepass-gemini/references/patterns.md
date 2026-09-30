@@ -17,6 +17,23 @@ at the same budget gives the same prefix.
 `saveTo` gives you the full text on disk without pushing it all through context.
 Read the file if you need the tail.
 
+## Recover a turn that timed out
+
+```
+gemini_ask(query, timeoutMs: 60000)   # -> partial: true
+gemini_collect()                      # -> the finished answer, recovered: true
+```
+
+A timeout ends the *wait*, not the turn. The request is already in flight and
+Gemini normally finishes it, so collect before re-asking: the answer is usually
+already there, and re-asking pays for the same reasoning twice while possibly
+landing a different answer.
+
+`source: late-reply` means the extension answered after the host stopped
+waiting. `source: saved-conversation` means nothing reached the socket and the
+answer was re-read from what Gemini saved. Both are complete; only a failed
+collect justifies a re-ask at a larger budget.
+
 ## Reason over a document
 
 ```

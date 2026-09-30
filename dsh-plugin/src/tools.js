@@ -514,6 +514,73 @@ function createTools(bridge, config) {
     }),
   })
 
+  // -------------------------------------------------------------- collect --
+
+  tools.push({
+    name: 'gemini_collect',
+    description:
+      'Recover the answer to a gemini_ask that timed out, instead of re-asking and paying for the same reasoning '
+      + 'twice. When a turn is cut off the request is already in flight and Gemini usually finishes it anyway; this '
+      + 'hands back that finished answer, either from the extension\'s late reply or by re-reading the conversation '
+      + 'Gemini already saved. Use it as the first move after a timeout, before retrying the prompt. The answer is '
+      + 'flagged as recovered.',
+    parameters: {
+      actionId: {
+        type: 'string',
+        description: 'Id of the timed-out action, when the caller captured one. Defaults to the most recent timed-out ask.',
+      },
+      timeoutMs: { type: 'number', description: 'How long to wait when re-reading the saved conversation (default 45s).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          chatId: { type: 'string', required: true, description: 'URL of the Gemini conversation that answered.' },
+          text: { type: 'string', required: true, description: 'The recovered answer.' },
+          chars: { type: 'integer', required: true, description: 'Length of the recovered answer.' },
+          source: {
+            type: 'string',
+            required: true,
+            description: 'How it was recovered: late-reply (the extension answered after the timeout) or saved-conversation (re-read from the page).',
+          },
+          recovered: { type: 'boolean', required: true, description: 'Always true: the answer came from a turn whose wait had already expired.' },
+          elapsedMs: { type: 'integer', required: true, description: 'Wall-clock duration of the collection.' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: '[RECOVERED ANSWER — the original call timed out; this is the turn it abandoned]\n\n'
+          + (value.text.trim().length > 0 ? value.text : '(the conversation held no completed answer to collect.)')
+          + '\n\n(' + value.chars + ' chars, recovered from ' + value.source + ' in '
+          + (value.elapsedMs / 1000).toFixed(1) + 's)',
+      }],
+    },
+    async execute(args, exec) {
+      const startedAt = Date.now()
+      const response = await bridge.call(
+        'gemini_collect',
+        adapter => adapter.collectLastResponse({
+          actionId: typeof args.actionId === 'string' && args.actionId.length > 0 ? args.actionId : undefined,
+          timeoutMs: typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined,
+        }),
+        exec.signal,
+      )
+      const text = typeof response?.text === 'string' ? response.text : ''
+      return {
+        chatId: typeof response?.chatId === 'string' ? response.chatId : '',
+        text,
+        chars: text.length,
+        // A re-read is the fallback, so anything that is not a retained reply
+        // came from the saved conversation.
+        source: response?.recoveredFrom === 'late-reply' ? 'late-reply' : 'saved-conversation',
+        recovered: true,
+        elapsedMs: Date.now() - startedAt,
+      }
+    },
+    presentCall: () => ({ card: 'generic', title: 'Collect timed-out Gemini answer', kind: 'other' }),
+  })
+
   // ------------------------------------------------------------ screenshot --
 
   tools.push({
@@ -1005,7 +1072,7 @@ function createCommand(bridge, config) {
       const snapshot = probed ? await bridge.probe() : bridge.status()
       const lines = statusLines(statusValue(snapshot, probed))
       lines.push('')
-      lines.push('tools: gemini_ask, gemini_ask_with_files, gemini_screenshot, gemini_dom_snapshot, '
+      lines.push('tools: gemini_ask, gemini_ask_with_files, gemini_collect, gemini_screenshot, gemini_dom_snapshot, '
         + 'gemini_page_info, gemini_tabs, gemini_session, gemini_history, gemini_open_chat, gemini_click'
         + (config.enableCookieTools ? ', gemini_cookies_backup, gemini_cookies_restore' : ''))
       return { kind: 'success', text: lines.join('\n') }

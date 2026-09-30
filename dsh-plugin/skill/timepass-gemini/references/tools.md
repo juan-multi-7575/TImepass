@@ -1,6 +1,6 @@
 # gemini_* tool map
 
-Thirteen tools plus one slash command. All of them talk to the same bridge; only
+Fourteen tools plus one slash command. All of them talk to the same bridge; only
 `gemini_status` and `gemini_ask*` are needed for most work.
 
 ## Asking
@@ -43,6 +43,27 @@ partial upload fails the call instead of producing a quietly wrong answer.
 | `model`, `newChat`, `timeoutMs`, `saveTo` | as above |
 
 Use this for a document, PDF, image, or CSV Gemini must read.
+
+### `gemini_collect`
+Recover the answer to an ask that timed out, instead of re-asking and paying for
+the same reasoning twice.
+
+| Param | Notes |
+|---|---|
+| `actionId` | the timed-out action's id, when you captured one; defaults to the most recent timed-out ask |
+| `timeoutMs` | how long to wait when re-reading the saved conversation, default 45000 |
+
+When a turn is cut off the request is already in flight and Gemini normally
+finishes it anyway. `gemini_collect` looks in two places, in order:
+
+1. **`source: late-reply`** — the extension's own reply landed after the host
+   stopped waiting. Cheap and exact.
+2. **`source: saved-conversation`** — nothing reached the socket, so the answer
+   is re-read from what Gemini already saved. Nothing is re-asked.
+
+Returns `chatId`, `text`, `chars`, `source`, `recovered` (always `true`), and
+`elapsedMs`. If neither place holds an answer the call fails and says so; only
+then is re-asking the right move.
 
 ## Inspecting
 

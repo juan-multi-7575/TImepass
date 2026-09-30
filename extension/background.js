@@ -209,7 +209,10 @@ const ASYNC_ACTIONS = new Set([
   "type_prompt",
   "inject_and_send",
   "click_send",
-  "stream_response"
+  "stream_response",
+  // Polls the page until the saved answer settles, so it must be dispatched
+  // once and awaited rather than retried on `undefined`.
+  "recover_last_response"
 ]);
 
 // Helper to send message to tab with retry while content.js initializes

@@ -10,6 +10,8 @@
  *                                      # Chrome extension
  *   node scratch/driver.mjs --fake     # with a stand-in extension: every success
  *                                      # path, including artifacts on disk
+ *   node scratch/driver.mjs --recover  # an ask that outlives its wait, then
+ *                                      # gemini_collect recovering the answer
  */
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
@@ -21,6 +23,7 @@ import { startFakeExtension } from './fake-extension.mjs'
 const STATE_NAME = { 0: 'PENDING', 1: 'LOADING', 2: 'ACTIVE', 3: 'FAILED', 4: 'DISPOSED' }
 const scratchDir = path.dirname(fileURLToPath(import.meta.url))
 const useFake = process.argv.includes('--fake')
+const useRecover = process.argv.includes('--recover')
 
 let callIndex = 0
 let failures = 0
@@ -100,9 +103,46 @@ async function main() {
   // Start the stand-in extension before the first call. It is not awaited: the
   // bridge only starts listening once a tool call needs it, so the fake dials in
   // the background and connects the moment that happens.
-  const fake = useFake ? startFakeExtension({ verbose: true }) : null
+  const fake = useFake || useRecover ? startFakeExtension({ verbose: true }) : null
 
-  if (!useFake) {
+  if (useRecover) {
+    // The recovery path end to end: an ask whose wait expires while the turn is
+    // still running, then the answer collected afterwards instead of lost.
+    // A 300ms budget plus the driver's 15s grace means each abandoned ask costs
+    // ~15s of real time, which is why this mode is opt-in.
+    const status = await run(ctx, 'gemini_status', { probe: true }, 'gemini_status with a probe (extension present)')
+    check('the probe reports a connected extension', status.text.includes('chrome extension: connected'))
+
+    const timedOut = await run(ctx, 'gemini_ask', {
+      query: 'SLOW:16000:a long research prompt',
+      timeoutMs: 300,
+    }, 'gemini_ask whose turn outlives its wait', { expectError: true })
+    check('the abandoned ask reports the wait it actually made', timedOut.text.includes('15300ms'))
+
+    // The reply is late *by construction*, so it cannot have arrived yet: the
+    // host gave up at 15300ms and the fake answers at 16000ms. Collecting in
+    // that gap falls through to the page re-read (the SILENT scenario below),
+    // which is correct — waiting out the difference is what makes this the
+    // late-reply path rather than a race.
+    await new Promise(resolve => setTimeout(resolve, 1500))
+
+    const collected = await run(ctx, 'gemini_collect', {}, 'gemini_collect (the extension answered late)')
+    check('the late answer is recovered instead of discarded',
+      collected.text.includes('RECOVERED ANSWER') && collected.text.includes('recovered from late-reply'))
+
+    // The socket never delivers this one, so only the saved conversation can.
+    await run(ctx, 'gemini_ask', {
+      query: 'SILENT:no reply ever arrives',
+      timeoutMs: 300,
+    }, 'gemini_ask whose reply never arrives', { expectError: true })
+
+    const reread = await run(ctx, 'gemini_collect', { timeoutMs: 5000 }, 'gemini_collect (re-read from the saved conversation)')
+    check('a lost reply falls back to the saved conversation',
+      reread.text.includes('Saved conversation answer') && reread.text.includes('recovered from saved-conversation'))
+
+    await fake.ready
+    check('the stand-in extension served every scenario', fake.answered() >= 3)
+  } else if (!useFake) {
     await run(ctx, 'gemini_status', {}, 'gemini_status without a probe (never touches the browser)')
     const probed = await run(ctx, 'gemini_status', { probe: true }, 'gemini_status with a probe (no extension)', { expectError: true })
     check('a probe with no extension reports an actionable error',

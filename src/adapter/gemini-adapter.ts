@@ -26,6 +26,12 @@ export class GeminiAdapter {
   private driver: BrowserDriver;
   private registry: ComponentRegistry;
   private defaultOptions: GeminiOptions;
+  /**
+   * The action the host gave up waiting for, if any. A timed-out ask is not
+   * necessarily lost — the extension goes on to finish the turn — so the id is
+   * kept for collectLastResponse() to pick the answer up with.
+   */
+  private abandonedAction: { id: string; at: number } | null = null;
 
   constructor(options: GeminiOptions = {}) {
     const merged = { ...options };
@@ -94,7 +100,92 @@ export class GeminiAdapter {
     }
 
     const errMsg = res.error || (res.data && res.data.error) || 'Failed to get Gemini response.';
+    if (res.late && res.id) {
+      // The wait expired but the turn is still running in the page. Remember the
+      // id so the finished answer can be collected instead of forcing a re-ask
+      // that pays for the same reasoning twice.
+      this.abandonedAction = { id: res.id, at: Date.now() };
+    }
+    // When the extension returned a result carrying neither error nor
+    // data.error, every distinct failure used to collapse into the sentence
+    // below, which is undiagnosable. Say which shape arrived instead.
+    if (errMsg === 'Failed to get Gemini response.' && res.data) {
+      throw new Error(`${errMsg} (result had no error field: ${JSON.stringify(res.data).slice(0, 200)})`);
+    }
     throw new Error(errMsg);
+  }
+
+  /**
+   * Recover the answer to a turn whose wait ran out.
+   *
+   * The work survives being abandoned in two ways: the extension's own reply
+   * may have landed after the host stopped waiting (retained by the driver and
+   * handed back here), or the answer may already be saved in the conversation
+   * even though no reply ever reached the socket (re-read from the page, the
+   * same routine the freeze watchdog uses). Either way the caller gets the
+   * completed text instead of an error, flagged as `recovered`.
+   */
+  async collectLastResponse(options?: { actionId?: string; timeoutMs?: number }): Promise<GeminiResponse> {
+    const actionId = options?.actionId ?? this.abandonedAction?.id;
+
+    const late = await this.driver.collectLate<{
+      success?: boolean;
+      turnComplete?: boolean;
+      text?: string;
+      chatId?: string;
+      partial?: boolean;
+      error?: string;
+    }>(actionId);
+
+    if (late && late.success && late.data && typeof late.data.text === 'string' && late.data.text.length > 0) {
+      if (this.abandonedAction && (!actionId || actionId === this.abandonedAction.id)) {
+        this.abandonedAction = null;
+      }
+      return {
+        chatId: late.data.chatId || 'https://gemini.google.com/app',
+        text: late.data.text,
+        images: [],
+        recovered: true,
+        recoveredFrom: 'late-reply',
+        partial: late.data.partial === true
+      };
+    }
+
+    // Nothing was retained, so ask the page: the conversation may hold a
+    // completed answer even though no reply reached the socket. Nothing is
+    // re-asked. The driver adds its own grace on top of this budget.
+    const budgetMs = options?.timeoutMs ?? 45000;
+    const reread = await this.driver.executeAction<{
+      success: boolean;
+      recovered?: boolean;
+      text?: string;
+      chatId?: string;
+      error?: string;
+    }>({
+      action: 'recover_last_response',
+      payload: { timeoutMs: budgetMs },
+      timeoutMs: budgetMs
+    });
+
+    if (reread.success && reread.data && reread.data.success && typeof reread.data.text === 'string') {
+      if (this.abandonedAction && (!actionId || actionId === this.abandonedAction.id)) {
+        this.abandonedAction = null;
+      }
+      return {
+        chatId: reread.data.chatId || 'https://gemini.google.com/app',
+        text: reread.data.text,
+        images: [],
+        recovered: true,
+        recoveredFrom: 'saved-conversation',
+        partial: false
+      };
+    }
+
+    const why = late?.error || reread.error || reread.data?.error;
+    throw new Error(
+      'Nothing to collect: no answer was retained for the last timed-out turn and the saved conversation '
+      + 'did not yield one' + (why ? ` (${why})` : '') + '.'
+    );
   }
 
   async stream(prompt: string, options?: GeminiOptions): Promise<GeminiResponse> {
@@ -170,6 +261,11 @@ export class GeminiAdapter {
 
       actionPromise.then((res) => {
         if (!res.success || !res.data?.success) {
+          if (res.late && res.id) {
+            // Same as ask(): the turn is still running, so keep the id for a
+            // later collect rather than treating the answer as lost.
+            this.abandonedAction = { id: res.id, at: Date.now() };
+          }
           fail(new Error(res.error || res.data?.error || 'Failed to stream Gemini response.'));
           return;
         }
@@ -290,7 +386,11 @@ export class GeminiAdapter {
     }
     const res = await this.driver.executeAction<{ success: boolean; error?: string }>({
       action: 'file_upload',
-      payload
+      payload,
+      // An upload is a wait like any other: without this it silently fell back
+      // to the driver's 60s default, the same ceiling this adapter hoists
+      // timeoutMs to avoid on the ask path.
+      timeoutMs: opts.timeoutMs
     });
 
     if (res.success && res.data && res.data.success) {
@@ -323,7 +423,8 @@ export class GeminiAdapter {
 
       const uploadRes = await this.driver.executeAction<{ success: boolean; error?: string }>({
         action: 'file_upload',
-        payload: uploadPayload
+        payload: uploadPayload,
+        timeoutMs: opts.timeoutMs
       });
 
       if (!uploadRes.success || !uploadRes.data?.success) {
@@ -333,7 +434,8 @@ export class GeminiAdapter {
 
     // Step 2: Verify files are attached (check file input)
     const verifyRes = await this.driver.executeAction<{ success: boolean; fileInputs: number; error?: string }>({
-      action: 'get_page_info'
+      action: 'get_page_info',
+      timeoutMs: opts.timeoutMs
     });
 
     if (!verifyRes.success || verifyRes.data?.fileInputs === 0) {

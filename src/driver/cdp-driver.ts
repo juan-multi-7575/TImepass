@@ -18,6 +18,12 @@ export class CdpDriver implements BrowserDriver {
     return { success: true, data: undefined };
   }
 
+  async collectLate<T = unknown>(_id?: string): Promise<ActionResult<T> | null> {
+    // CDP evaluates synchronously over the DevTools socket, so there is no
+    // reply that can outlive its own timeout. Nothing is ever retained.
+    return null;
+  }
+
   onEvent(event: string, callback: (data: any) => void): void {
     // CDP event binding
   }

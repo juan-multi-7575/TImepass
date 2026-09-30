@@ -26,8 +26,19 @@ export interface GeminiResponse {
   /**
    * True when the answer was re-read from Gemini's saved conversation after the
    * tab froze and was reloaded, rather than collected from the live stream.
+   *
+   * Also true for a turn whose wait timed out and whose answer was collected
+   * afterwards — either from the extension's late reply or by re-reading the
+   * saved conversation. The text may therefore have been assembled across two
+   * calls rather than during one.
    */
   recovered?: boolean;
+  /**
+   * Where a recovered answer came from, when `recovered` is true. `late-reply`
+   * is the extension's own reply landing after the host stopped waiting;
+   * `saved-conversation` is a re-read of what Gemini had already saved.
+   */
+  recoveredFrom?: 'late-reply' | 'saved-conversation';
   /**
    * True when the wait ran out before the answer finished. `text` then holds
    * only what had rendered by that point, so treat it as a fragment. Absent or

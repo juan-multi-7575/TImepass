@@ -27,6 +27,10 @@ class FakeDriver implements BrowserDriver {
     return Promise.resolve();
   }
 
+  async collectLate<T = unknown>(_id?: string): Promise<ActionResult<T> | null> {
+    return null;
+  }
+
   onEvent(event: string, callback: (data: any) => void): void {
     const listeners = this.listeners.get(event) || [];
     listeners.push(callback);
@@ -127,6 +131,112 @@ describe('GeminiAdapter.stream', () => {
     expect(response.chatId).toBe('chat-1');
     expect(driver.listenerCount('stream_delta')).toBe(0);
     expect(driver.listenerCount('turn_complete')).toBe(0);
+  });
+});
+
+describe('GeminiAdapter.collectLastResponse', () => {
+  const adapters: GeminiAdapter[] = [];
+
+  afterEach(() => {
+    for (const adapter of adapters.splice(0)) {
+      adapter.close();
+    }
+  });
+
+  it('hands back the answer the extension sent after the timeout', async () => {
+    const adapter = new GeminiAdapter();
+    adapters.push(adapter);
+    const collected: (string | undefined)[] = [];
+    (adapter as any).driver = {
+      executeAction: async () => ({
+        success: false,
+        late: true,
+        id: 'act_timed_out',
+        error: 'Action execution timed out after 75000ms waiting for extension.'
+      }) as ActionResult<any>,
+      collectLate: async (id?: string) => {
+        collected.push(id);
+        return {
+          success: true,
+          late: true,
+          id: 'act_timed_out',
+          data: { success: true, turnComplete: true, text: 'the whole answer', chatId: 'chat-1' }
+        } as ActionResult<any>;
+      },
+      close: async () => {}
+    };
+
+    await expect(adapter.ask('a long prompt', { timeoutMs: 1000 })).rejects.toThrow(/timed out/);
+
+    const recovered = await adapter.collectLastResponse();
+    expect(recovered).toMatchObject({
+      text: 'the whole answer',
+      chatId: 'chat-1',
+      recovered: true,
+      recoveredFrom: 'late-reply'
+    });
+    // Collection must ask for the very id the timeout handed back.
+    expect(collected).toContain('act_timed_out');
+  });
+
+  it('re-reads the saved conversation when no late reply was retained', async () => {
+    const adapter = new GeminiAdapter();
+    adapters.push(adapter);
+    const actions: string[] = [];
+    (adapter as any).driver = {
+      executeAction: async (payload: any) => {
+        actions.push(payload.action);
+        if (payload.action === 'recover_last_response') {
+          return {
+            success: true,
+            data: { success: true, recovered: true, text: 'the saved answer', chatId: 'chat-9' }
+          } as ActionResult<any>;
+        }
+        return { success: true, data: { success: true, turnComplete: true, text: 'live', chatId: 'chat-1' } } as ActionResult<any>;
+      },
+      collectLate: async () => null,
+      close: async () => {}
+    };
+
+    await expect(adapter.collectLastResponse()).resolves.toMatchObject({
+      text: 'the saved answer',
+      chatId: 'chat-9',
+      recovered: true,
+      recoveredFrom: 'saved-conversation'
+    });
+    // Re-reading must not re-ask: the turn is not sent again.
+    expect(actions).toContain('recover_last_response');
+    expect(actions).not.toContain('inject_and_send');
+  });
+
+  it('says so plainly when neither the socket nor the page has the answer', async () => {
+    const adapter = new GeminiAdapter();
+    adapters.push(adapter);
+    (adapter as any).driver = {
+      executeAction: async () => ({
+        success: true,
+        data: { success: false, error: 'the saved response never finished rendering' }
+      }) as ActionResult<any>,
+      collectLate: async () => null,
+      close: async () => {}
+    };
+
+    await expect(adapter.collectLastResponse()).rejects.toThrow(/Nothing to collect/);
+    await expect(adapter.collectLastResponse()).rejects.toThrow(/never finished rendering/);
+  });
+
+  it('names an opaque failure instead of collapsing it into one sentence', async () => {
+    const adapter = new GeminiAdapter();
+    adapters.push(adapter);
+    // An extension result carrying neither `error` nor `data.error`: this used
+    // to be indistinguishable from every other failure mode.
+    (adapter as any).driver = {
+      executeAction: async () => ({ success: true, data: { success: false, turnComplete: false } }) as ActionResult<any>,
+      collectLate: async () => null,
+      close: async () => {}
+    };
+
+    await expect(adapter.ask('hello')).rejects.toThrow(/result had no error field/);
   });
 });
 

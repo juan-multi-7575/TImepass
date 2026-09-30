@@ -17,6 +17,7 @@
     "lint": "eslint extension/ --ext .js",
     "dsh:scratch": "node dsh-plugin/scratch/driver.mjs",
     "dsh:scratch:fake": "node dsh-plugin/scratch/driver.mjs --fake",
+    "dsh:scratch:recover": "node dsh-plugin/scratch/driver.mjs --recover",
     "dsh:check": "tsc -p dsh-plugin/tsconfig.json"
   },
   "keywords": [

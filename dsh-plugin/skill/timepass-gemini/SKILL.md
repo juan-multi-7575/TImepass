@@ -60,9 +60,9 @@ are allowed to say.
 
 | Flag | Meaning | What you may do |
 |---|---|---|
-| `partial: true` | **The turn timed out mid-answer.** The text is a fragment and the response continues past it. | Never present it as the full answer. Re-ask with a larger `timeoutMs`. Say plainly that it is incomplete. |
+| `partial: true` | **The turn timed out mid-answer.** The text is a fragment and the response continues past it. | Never present it as the full answer. Call `gemini_collect` **first** — the turn usually finished after the host gave up. Re-ask only if the collect finds nothing, and then with a larger `timeoutMs`. |
 | `truncated: true` | Only a *display* bound was hit. | Harmless. The complete answer is at `savedTo`; read that file if you need the rest. |
-| `recovered: true` | The tab froze and was reloaded; text was re-read from Gemini's saved conversation. | Harmless and complete. |
+| `recovered: true` | The answer was re-read from Gemini's saved conversation — after a tab freeze, or collected after a timeout. | Harmless and complete. Check `recoveredFrom` if you need to know which. |
 
 `partial` and `truncated` are unrelated and demand opposite responses. A
 partial answer is also usually `truncated` false — it is short because it
@@ -82,6 +82,14 @@ gemini_ask(query: "...", timeoutMs: 300000)
 ```
 
 Do not retry a partial answer at the same timeout — it will truncate identically.
+Do not retry it *at all* until you have tried `gemini_collect`: a timed-out turn
+is usually a finished turn the host stopped waiting for, and collecting it costs
+one cheap call instead of the whole reasoning budget again.
+
+```
+gemini_ask(query: "...", timeoutMs: 60000)   # returns partial: true
+gemini_collect()                             # the finished answer, source: late-reply
+```
 
 ## Model
 
@@ -91,7 +99,7 @@ declaration rather than a guarantee.
 
 ## Reference router
 
-- `references/tools.md` — all twelve `gemini_*` tools and the `/gemini` command
+- `references/tools.md` — all fourteen `gemini_*` tools and the `/gemini` command
 - `references/troubleshooting.md` — error strings, what causes them, what fixes them
 - `references/patterns.md` — worked shapes for common tasks
 

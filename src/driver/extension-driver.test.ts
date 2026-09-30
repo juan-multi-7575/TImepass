@@ -141,6 +141,175 @@ describe('ExtensionDriver timer hygiene', () => {
   });
 });
 
+describe('ExtensionDriver late responses', () => {
+  let drivers: ExtensionDriver[] = [];
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    for (const d of drivers.splice(0)) {
+      await d.close().catch(() => {});
+    }
+  });
+
+  /**
+   * Drive an action past its timeout and *then* deliver the reply the
+   * extension would send — the exact sequence that used to throw the finished
+   * answer away.
+   */
+  async function abandonedThenReplied(reply: any, id?: string) {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+    const pending = driver.executeAction({ action: 'inject_and_send', timeoutMs: 1000, id } as any);
+    // 1000ms budget + 15000ms grace: the host stops waiting here.
+    await vi.advanceTimersByTimeAsync(20000);
+    const result = await pending;
+    expect(result).toMatchObject({ success: false, late: true });
+    (driver as any).handleMessage({ id: result.id, ...reply });
+    return { driver, result };
+  }
+
+  it('marks a timed-out action as late and hands back the id to collect by', async () => {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+
+    const pending = driver.executeAction({ action: 'inject_and_send', timeoutMs: 1000 } as any);
+    await vi.advanceTimersByTimeAsync(20000);
+
+    const result = await pending;
+    expect(result).toMatchObject({ success: false, late: true });
+    // Without the id the caller has no handle on the turn it just abandoned.
+    expect(result.id).toBeTruthy();
+  });
+
+  it('keeps the answer that arrives after the host gave up', async () => {
+    const { driver } = await abandonedThenReplied({
+      success: true,
+      response: { success: true, turnComplete: true, text: 'the whole answer', chatId: 'chat-1' }
+    });
+
+    const collected = await driver.collectLate();
+    expect(collected).toMatchObject({ success: true, late: true });
+    expect((collected as any).data).toMatchObject({ text: 'the whole answer', chatId: 'chat-1' });
+  });
+
+  it('collects by id and hands the answer out only once', async () => {
+    const { driver, result } = await abandonedThenReplied({
+      success: true,
+      response: { success: true, turnComplete: true, text: 'the whole answer' }
+    });
+
+    await expect(driver.collectLate(result.id)).resolves.toMatchObject({ success: true });
+    // A second collect must not replay the same text as though it were fresh.
+    await expect(driver.collectLate(result.id)).resolves.toBeNull();
+    await expect(driver.collectLate()).resolves.toBeNull();
+  });
+
+  it('reports a clear miss when nothing was retained', async () => {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+
+    await expect(driver.collectLate('act_never_existed')).resolves.toBeNull();
+    await expect(driver.collectLate()).resolves.toBeNull();
+  });
+
+  it('ignores a reply for an id it never sent', async () => {
+    const { driver } = driverWithSocket();
+
+    (driver as any).handleMessage({ id: 'act_not_ours', success: true, response: { text: 'a stray reply' } });
+
+    await expect(driver.collectLate('act_not_ours')).resolves.toBeNull();
+    expect((driver as any).lateResponses.size).toBe(0);
+  });
+
+  it('routes a reply for a live action straight back to its caller', async () => {
+    vi.useFakeTimers();
+    const { driver, send } = driverWithSocket();
+
+    const pending = driver.executeAction({ action: 'read_history', timeoutMs: 5000 } as any);
+    const { id } = JSON.parse(send.mock.calls[0][0]);
+    (driver as any).handleMessage({ id, success: true, response: { history: [] } });
+
+    await expect(pending).resolves.toMatchObject({ success: true, id });
+    expect((driver as any).lateResponses.size).toBe(0);
+  });
+
+  it('forgets a retained answer once it is too old to be the turn in question', async () => {
+    const { driver } = await abandonedThenReplied({
+      success: true,
+      response: { success: true, turnComplete: true, text: 'a stale answer' }
+    });
+
+    await vi.advanceTimersByTimeAsync(31 * 60 * 1000);
+
+    await expect(driver.collectLate()).resolves.toBeNull();
+  });
+
+  it('bounds what it retains so a long session cannot grow without limit', async () => {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+
+    for (let i = 0; i < 25; i++) {
+      const pending = driver.executeAction({ action: 'inject_and_send', timeoutMs: 1000, id: `act_${i}` } as any);
+      await vi.advanceTimersByTimeAsync(20000);
+      await pending;
+      (driver as any).handleMessage({ id: `act_${i}`, success: true, response: { text: `answer ${i}` } });
+    }
+
+    // Oldest evicted, newest kept.
+    await expect(driver.collectLate('act_0')).resolves.toBeNull();
+    await expect(driver.collectLate('act_24')).resolves.toMatchObject({ success: true });
+  });
+
+  it('retains the answer over a real socket, not just through the handler', async () => {
+    // The routing rules above are exercised on the extracted handler; this one
+    // proves the reply actually reaches it, so a reply arriving after the
+    // timeout is kept end to end rather than dropped at the socket boundary.
+    const driver = new ExtensionDriver(0);
+    drivers.push(driver);
+
+    const connectPromise = driver.connect();
+    await new Promise((r) => setTimeout(r, 0));
+    const port = ((driver as any).wss as any).address().port;
+
+    let receivedId = '';
+    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    client.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString());
+      if (msg.id && msg.action) receivedId = msg.id; // Hold the reply back on purpose.
+    });
+    await new Promise<void>((res) => client.on('open', res));
+    await connectPromise;
+
+    vi.useFakeTimers();
+
+    const pending = driver.executeAction({ action: 'inject_and_send', timeoutMs: 1000 });
+    // Let the real socket deliver the outbound action, then stop waiting.
+    for (let i = 0; i < 20 && !receivedId; i++) {
+      await vi.advanceTimersByTimeAsync(5);
+    }
+    expect(receivedId).toBeTruthy();
+
+    await vi.advanceTimersByTimeAsync(20000);
+    await expect(pending).resolves.toMatchObject({ success: false, late: true, id: receivedId });
+
+    // The extension answers now, long after the host stopped waiting.
+    client.send(JSON.stringify({
+      id: receivedId,
+      success: true,
+      response: { success: true, turnComplete: true, text: 'the whole answer', chatId: 'chat-1' }
+    }));
+    for (let i = 0; i < 20; i++) {
+      await vi.advanceTimersByTimeAsync(5);
+    }
+
+    const collected = await driver.collectLate(receivedId);
+    expect(collected).toMatchObject({ success: true, late: true });
+    expect((collected as any).data).toMatchObject({ text: 'the whole answer' });
+
+    client.close();
+  });
+});
+
 describe('ExtensionDriver socket ownership', () => {
   let drivers: ExtensionDriver[] = [];
 
