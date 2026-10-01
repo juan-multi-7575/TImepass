@@ -105,6 +105,9 @@ async function connectWebSocket() {
       console.log("[Timepass MV3] Connected to local timepass WebSocket server.");
       reconnectAttempts = 0;
       chrome.storage.local.set({ status: "connected", lastConnected: Date.now() });
+      // Introduce ourselves only once the socket is genuinely open, so the
+      // announcement cannot be lost to a not-yet-open channel.
+      sendBridgeHello();
     };
 
     socket.onmessage = async (event) => {
@@ -135,11 +138,145 @@ async function connectWebSocket() {
   }
 }
 
+/**
+ * Announce which build is actually running and what it can dispatch.
+ *
+ * `buildId` is read from the manifest rather than hardcoded, because the whole
+ * value of this message is that it comes from the worker that is really
+ * executing: a worker still holding pre-edit code reports the old id, and that
+ * mismatch is the signal the operator needs.
+ */
+function sendBridgeHello() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify({
+      type: "bridge_hello",
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      buildId: runningBuildId(),
+      actions: KNOWN_ACTIONS,
+      asyncActions: [...ASYNC_ACTIONS]
+    }));
+  } catch (err) {
+    console.warn("[Timepass MV3] Could not send the bridge handshake:", err);
+  }
+}
+
+/**
+ * React to the host's introduction. Purely advisory: a mismatch changes nothing
+ * about behaviour, it only becomes visible. Silence here is what let a stale
+ * worker look healthy for a whole retest, so the signal is pushed three ways --
+ * the console, a toolbar badge the operator cannot miss, and a message back to
+ * the host so it lands in the tool output instead of a devtools window nobody
+ * has open.
+ */
+function handleBridgeHello(message) {
+  const mine = runningBuildId();
+  const expected = message.expectedExtensionBuildId;
+  const problems = [];
+
+  if (typeof expected === "string" && expected && mine && expected !== mine) {
+    problems.push(
+      `build mismatch: the host expects extension build ${expected} but this worker is running ${mine}. ` +
+      'The worker is running code that is not on disk — reload it at chrome://extensions → Reload, ' +
+      'then restart the DSH session.'
+    );
+  }
+
+  if (Array.isArray(message.knownActions)) {
+    const unsupported = message.knownActions.filter(action => !KNOWN_ACTIONS.includes(action));
+    if (unsupported.length) {
+      problems.push(
+        `the host will send ${unsupported.length} action(s) this build cannot handle: ` +
+        `${unsupported.join(", ")}. Reload the extension at chrome://extensions → Reload.`
+      );
+    }
+  }
+
+  if (problems.length) {
+    const summary = problems.join(" | ");
+    console.warn(`[Timepass MV3] Bridge handshake problem: ${summary}`);
+    // Tell the host, so the mismatch shows up in the tool output.
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "bridge_mismatch", message: summary }));
+      } catch (err) {
+        console.warn("[Timepass MV3] Could not report the handshake mismatch:", err);
+      }
+    }
+    // And badge the toolbar: red "!" until the operator reloads.
+    try {
+      chrome.action.setBadgeBackgroundColor({ color: "#d73a4a" });
+      chrome.action.setBadgeText({ text: "!" });
+      chrome.action.setTitle?.({ title: `Timepass: ${summary}` });
+    } catch { /* the action API is best-effort decoration */ }
+  } else {
+    // Agreement clears any stale warning, so the badge cannot outlive the fix.
+    try {
+      chrome.action.setBadgeText({ text: "" });
+      chrome.action.setTitle?.({ title: "Timepass Gemini" });
+    } catch { /* best-effort */ }
+  }
+}
+
+// --- Tab selection and load-wait ---------------------------------------------
+// The bridge drives ONE Gemini tab, but the operator may have several: the
+// pinned one we create, plus any they opened by hand, plus tabs a watchdog
+// reload left behind. `chrome.tabs.query` makes no ordering promise, so the old
+// `tabs[0]` could adopt a discarded tab (whose content script is gone) or the
+// operator's foreground tab. Both are avoidable, so rank explicitly.
+const TAB_LOAD_BUDGET_MS = 30000;
+const TAB_LOAD_POLL_MS = 250;
+
+/**
+ * Is this tab usable right now? `discarded` is checked explicitly rather than
+ * inferred from `status`: a discarded tab keeps its URL and can still report
+ * `status: "complete"`, so a status-only test would wave a dead tab through.
+ */
+function tabIsReady(tab) {
+  return !!tab &&
+    tab.status === "complete" &&
+    !tab.discarded &&
+    typeof tab.url === "string" &&
+    tab.url.includes("gemini.google.com");
+}
+
+/** Order two candidate tabs, best first. Pure, so it is directly testable. */
+function compareGeminiTabs(a, b) {
+  // A live tab always beats a discarded one.
+  if (!!a.discarded !== !!b.discarded) return a.discarded ? 1 : -1;
+  // Then a finished load beats one still in flight.
+  if (tabIsReady(a) !== tabIsReady(b)) return tabIsReady(a) ? -1 : 1;
+  // Then our own pinned tab, which is the one we keep warm on purpose.
+  if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+  // Then leave the operator's foreground tab alone.
+  if (!!a.active !== !!b.active) return a.active ? 1 : -1;
+  // Finally the most recently used.
+  const la = typeof a.lastAccessed === "number" ? a.lastAccessed : -1;
+  const lb = typeof b.lastAccessed === "number" ? b.lastAccessed : -1;
+  return lb - la;
+}
+
+/** Pick the best Gemini tab from a query result, or null when there are none. */
+function pickGeminiTab(tabs) {
+  if (!Array.isArray(tabs) || tabs.length === 0) return null;
+  return tabs.slice().sort(compareGeminiTabs)[0];
+}
+
+/** Truthful description of a tab for an error message. */
+function describeTabState(tab) {
+  if (!tab) return "no tab (resolution failed before a tab was obtained)";
+  const flags = [`status=${tab.status}`];
+  if (tab.discarded) flags.push("discarded");
+  if (tab.active) flags.push("active");
+  if (tab.pinned) flags.push("pinned");
+  return `tab ${tab.id} at ${tab.url || "(no url)"} [${flags.join(", ")}]`;
+}
+
 // Ensure Gemini tab exists and is in the "Timepass Gemini" Tab Group
 async function getOrCreateGeminiTab(targetUrl = "https://gemini.google.com/app") {
-  // Query existing Gemini tabs
+  // Query existing Gemini tabs and pick the healthiest one.
   const tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
-  let tab = tabs[0];
+  let tab = pickGeminiTab(tabs);
 
   if (!tab) {
     // Create new pinned background tab
@@ -152,11 +289,12 @@ async function getOrCreateGeminiTab(targetUrl = "https://gemini.google.com/app")
     if (targetUrl && tab.url !== targetUrl) {
       await chrome.tabs.update(tab.id, { url: targetUrl });
       tab = await waitTabLoaded(tab.id);
-    } else if (tab.discarded || tab.status === "loading") {
-      // If background tab was discarded by Chrome, reload it to awake content.js
-      if (tab.discarded) {
-        await chrome.tabs.reload(tab.id);
-      }
+    } else if (tab.discarded) {
+      // A discarded tab has no live content script, so revive it before use.
+      await chrome.tabs.reload(tab.id);
+      tab = await waitTabLoaded(tab.id);
+    } else if (!tabIsReady(tab)) {
+      // Still loading, or committed somewhere we did not expect: wait it out.
       tab = await waitTabLoaded(tab.id);
     }
   }
@@ -167,16 +305,78 @@ async function getOrCreateGeminiTab(targetUrl = "https://gemini.google.com/app")
   return tab;
 }
 
-// Wait for a tab to finish loading and commit URL
-async function waitTabLoaded(tabId) {
-  for (let i = 0; i < 40; i++) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.status === "complete" && tab.url && tab.url.includes("gemini.google.com")) {
-      return tab;
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error("Timeout waiting for Gemini tab to load and commit domain permissions.");
+/**
+ * Wait until a tab is genuinely usable, on a real time budget.
+ *
+ * The old version ran `40 x 200ms` — an 8s budget, which Gemini's SPA regularly
+ * exceeds on a cold load or right after a watchdog reload. It also threw a
+ * message blaming "domain permissions", which is a different failure entirely
+ * and sent readers hunting for a permissions bug that was not there.
+ *
+ * Event-driven waiting has one classic trap: if `status:"complete"` already
+ * fired before we subscribe, an event-only wait hangs forever. The fix is
+ * ordering — subscribe FIRST, then re-check — so a completion landing in
+ * between is still observed, by whichever of the two arrives. A slow poll rides
+ * alongside as a safety net for tabs (discarded ones especially) whose events we
+ * might not hear, and a hard deadline guarantees this always settles, so no
+ * caller can be left hanging.
+ */
+function waitTabLoaded(tabId, options) {
+  const budgetMs = (options && options.budgetMs) || TAB_LOAD_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let pollTimer = null;
+
+    const cleanup = () => {
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      if (pollTimer !== null) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+    };
+
+    const settle = (err, tab) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (err) reject(err); else resolve(tab);
+    };
+
+    const check = async () => {
+      if (settled) return;
+      let tab;
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch (err) {
+        settle(new Error(`Gemini tab ${tabId} became unavailable while waiting for it to load: ${err.message}`));
+        return;
+      }
+      if (settled) return;
+      if (tabIsReady(tab)) {
+        settle(null, tab);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        settle(new Error(
+          `Timed out after ${budgetMs}ms waiting for Gemini tab ${tabId} to finish loading ` +
+          `(last seen: ${describeTabState(tab)}).`
+        ));
+        return;
+      }
+      pollTimer = setTimeout(check, TAB_LOAD_POLL_MS);
+    };
+
+    const onUpdated = (id, changeInfo) => {
+      if (id !== tabId || !changeInfo || changeInfo.status !== "complete") return;
+      check();
+    };
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    // Subscribe, THEN look: closes the missed-event race in both directions.
+    check();
+  });
 }
 
 // Group tab into "🤖 Timepass Gemini" group
@@ -214,6 +414,64 @@ const ASYNC_ACTIONS = new Set([
   // once and awaited rather than retried on `undefined`.
   "recover_last_response"
 ]);
+
+// --- Bridge handshake --------------------------------------------------------
+// What this build of the worker can actually do. A service worker keeps its
+// script in memory, so editing background.js changes nothing until the operator
+// reloads the extension. That made the last retest unfalsifiable: fixes landed
+// on disk while the live worker ran older code, and bugs were reproduced against
+// a build nobody was reviewing. Announcing the real manifest version and the
+// real dispatch table lets the host notice the skew instead of guessing.
+//
+// The list is grouped by HOW each action is served, because the grouping is what
+// makes it checkable: DISPATCH_ACTIONS mirrors the if-chain in
+// handleServerMessage one-for-one, and a test asserts that correspondence, so a
+// new branch cannot be added without advertising it here.
+const DISPATCH_ACTIONS = [
+  "capture_screenshot",
+  "dom_dump",
+  "click_button",
+  "file_upload",
+  "get_page_info",
+  "cookies:get",
+  "cookies:restore",
+  "tab_list",
+  "tab_create",
+  "tab_close",
+  "tab_switch",
+  "tab_group_list",
+  "inject_and_send"
+];
+
+// Served by the generic fall-through at the end of handleServerMessage, which
+// forwards anything unclaimed straight to content.js.
+const CONTENT_FORWARDED_ACTIONS = [
+  "read_history",
+  "select_history"
+];
+
+// Never host-dispatched through the chain: the freeze watchdog sends this
+// itself, and the driver may send it to collect a turn whose reply was lost.
+const INTERNAL_ACTIONS = [
+  "recover_last_response"
+];
+
+const KNOWN_ACTIONS = [
+  ...DISPATCH_ACTIONS,
+  ...CONTENT_FORWARDED_ACTIONS,
+  ...INTERNAL_ACTIONS
+];
+
+const BRIDGE_PROTOCOL_VERSION = 1;
+
+/** The build id the *running* worker reports, straight from the manifest. */
+function runningBuildId() {
+  try {
+    return chrome.runtime.getManifest().version;
+  } catch {
+    return null;
+  }
+}
 
 // Helper to send message to tab with retry while content.js initializes
 async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
@@ -273,18 +531,173 @@ async function sendMessageWithRetry(tabId, message, maxRetries = 3) {
   throw new Error("Max retries exceeded for tabId: " + tabId);
 }
 
-// Handle action dispatch from server to content script
-async function handleServerMessage(message) {
-  const { id, action, payload } = message;
-  let tab = null;
+// --- Screenshot capture ------------------------------------------------------
+// `capture_screenshot` used to maximise and focus the window, activate the
+// pinned Gemini tab, and then call chrome.tabs.captureVisibleTab. Two problems,
+// both observed live:
+//
+//   * captureVisibleTab only captures the ACTIVE tab of a window the browser is
+//     painting. Our tab is deliberately a *pinned background* tab, so the call
+//     depends on a foregrounding dance that can fail to take effect -- and when
+//     it did, the promise never settled and the driver burned its full 75s
+//     budget waiting for a reply that was never coming.
+//   * Even on success it stole the operator's window, their active tab and
+//     their maximised layout, and never gave any of it back.
+//
+// The fix is a capture that does not need focus at all, a bounded budget so the
+// action can never hang silently, and a restore in a finally so the operator's
+// desktop survives even a failure.
+const SCREENSHOT_BUDGET_MS = 15000;
+
+/**
+ * Run `task` with a hard deadline. The timer is always cleared so a late
+ * rejection cannot escape as an unhandled promise.
+ */
+async function withBudget(task, budgetMs, label) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(task),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} did not complete within ${budgetMs}ms`)),
+          budgetMs
+        );
+      })
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Preferred capture path: CDP over chrome.debugger. Page.captureScreenshot
+ * works against a background tab, so nothing needs focusing and the operator's
+ * desktop is never disturbed. The extension already holds the "debugger"
+ * permission and attaches elsewhere in this file, so this adds no permission.
+ */
+async function captureViaDebugger(tab) {
+  const debuggee = { tabId: tab.id };
+  try {
+    await chrome.debugger.attach(debuggee, "1.3");
+  } catch (err) {
+    // Typically "Another debugger is already attached" (DevTools open, or the
+    // file_upload path is mid-attach). Not fatal: the foreground path below can
+    // still serve the request.
+    throw new Error(`debugger unavailable (${err.message})`, { cause: err });
+  }
+  try {
+    // Best effort: some Chrome builds want the domain enabled first.
+    await chrome.debugger.sendCommand(debuggee, "Page.enable", {}).catch(() => {});
+    const result = await chrome.debugger.sendCommand(debuggee, "Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: true
+    });
+    if (!result || !result.data) throw new Error("Page.captureScreenshot returned no image data");
+    return `data:image/png;base64,${result.data}`;
+  } finally {
+    // Detach even on failure, or the tab stays debugger-owned and blocks
+    // DevTools for the user.
+    await chrome.debugger.detach(debuggee).catch(() => {});
+  }
+}
+
+/**
+ * Fallback capture via captureVisibleTab. This one genuinely needs the tab to be
+ * the visible active one, so it records what it is about to change and restores
+ * all of it in a finally -- including on the failure path, which is exactly
+ * when a half-finished foreground would otherwise strand the operator on the
+ * wrong tab with a resized window.
+ */
+async function captureViaForeground(tab) {
+  let previousTabId = null;
+  let previousWindow = null;
 
   try {
+    const [activeTab] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+    if (activeTab && activeTab.id !== tab.id) previousTabId = activeTab.id;
+    const win = await chrome.windows.get(tab.windowId);
+    if (win) previousWindow = { state: win.state, focused: win.focused };
+  } catch {
+    // Best effort: restoring something we failed to record is impossible, but
+    // it must never abort the capture itself.
+  }
+
+  try {
+    await chrome.windows.update(tab.windowId, { state: "maximized", focused: true });
+    await chrome.tabs.update(tab.id, { active: true });
+    await new Promise((r) => setTimeout(r, 200));
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+    if (!dataUrl) throw new Error("captureVisibleTab returned no image");
+    return dataUrl;
+  } finally {
+    if (previousTabId !== null) {
+      await chrome.tabs.update(previousTabId, { active: true }).catch(() => {});
+    }
+    if (previousWindow) {
+      await chrome.windows.update(tab.windowId, {
+        state: previousWindow.state,
+        focused: previousWindow.focused
+      }).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Capture the Gemini tab, preferring the path that needs no focus and falling
+ * back to the legacy one. Every path is bounded, so this always settles in
+ * seconds instead of hanging until the driver gives up.
+ */
+async function captureGeminiScreenshot(tab) {
+  let debuggerError;
+  try {
+    return await withBudget(() => captureViaDebugger(tab), SCREENSHOT_BUDGET_MS, "Page.captureScreenshot");
+  } catch (err) {
+    debuggerError = err;
+  }
+
+  try {
+    return await withBudget(() => captureViaForeground(tab), SCREENSHOT_BUDGET_MS, "captureVisibleTab");
+  } catch (foregroundError) {
+    // Report BOTH failures: "capture did not work" is useless to whoever has to
+    // diagnose it, and the two paths fail for entirely different reasons.
+    throw new Error(
+      `screenshot failed on both paths (debugger: ${debuggerError && debuggerError.message}; ` +
+      `foreground: ${foregroundError && foregroundError.message})`,
+      { cause: foregroundError }
+    );
+  }
+}
+
+// Handle action dispatch from server to content script
+async function handleServerMessage(message) {
+  // The host's introduction. Handled before the action chain and kept out of
+  // it, so a hello is never mistaken for an action and never reaches the
+  // content script. Purely additive: an old driver simply never sends one.
+  if (message && message.type === "bridge_hello") {
+    handleBridgeHello(message);
+    return;
+  }
+
+  const { id, action, payload } = message;
+  let tab = null;
+  // Which step we had reached when something threw. `tab` alone cannot say:
+  // it is null both before any tab exists AND after the one we did find was
+  // discarded or closed, which is why the old message claimed "No Tab found"
+  // for failures that had nothing to do with finding a tab.
+  let phase = "dispatch";
+
+  try {
+    phase = "resolving the Gemini tab";
     if (action === "capture_screenshot") {
-      tab = await getOrCreateGeminiTab(payload?.url);
-      await chrome.windows.update(tab.windowId, { state: "maximized", focused: true });
-      await chrome.tabs.update(tab.id, { active: true });
-      await new Promise((r) => setTimeout(r, 200));
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      phase = "resolving the Gemini tab";
+      tab = await withBudget(
+        () => getOrCreateGeminiTab(payload?.url),
+        TAB_LOAD_BUDGET_MS,
+        "resolving the Gemini tab for capture"
+      );
+      phase = "capturing a screenshot";
+      const dataUrl = await captureGeminiScreenshot(tab);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ id, success: true, response: { dataUrl } }));
       }
@@ -320,235 +733,242 @@ async function handleServerMessage(message) {
       tab = await getOrCreateGeminiTab(payload?.url);
       const debuggee = { tabId: tab.id };
       let debuggerAttached = false;
-      
+
+      // What each step actually saw on the page. A failure used to be a single
+      // sentence that named none of the attempts, so the next round of debugging
+      // started from zero; every step below records its evidence here instead.
+      const trace = [];
+      const note = (step, detail) => { trace.push(step + ": " + detail); };
+
+      // One in-page helper, reused by every step. It returns the ELEMENT rather
+      // than a description of it, and a handle to an element crosses the shadow
+      // boundary for free. That is the whole point: re-finding the element from
+      // the document with DOM.querySelector cannot cross it, because that command
+      // takes only nodeId + selector and has no `pierce` option (only
+      // DOM.getDocument / DOM.getFlattenedDocument expose one).
+      //
+      // NOTE: this is a template literal, so backslashes in the embedded source
+      // must be doubled or they are eaten by the enclosing string.
+      const PAGE_HELPER_JS = `(function (mode) {
+  function visible(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+    var r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    var s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+  }
+  function labelOf(el) {
+    var a = el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title'));
+    return ((a || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+  }
+  // The one traversal, shared by every mode: light DOM first, then each open
+  // shadow root. Depth-limited so a pathological page cannot hang the tab.
+  function walk(root, depth, visit) {
+    if (depth > 16 || !root || typeof root.querySelectorAll !== 'function') return false;
+    var all = root.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      if (visit(all[i]) === true) return true;
+      if (all[i].shadowRoot && walk(all[i].shadowRoot, depth + 1, visit) === true) return true;
+    }
+    return false;
+  }
+
+  if (mode === 'find-input') {
+    var input = null;
+    walk(document, 0, function (el) {
+      if (!el.matches || !el.matches('input[type="file"]')) return false;
+      input = el;
+      return true;
+    });
+    return input;
+  }
+
+  if (mode === 'open-menu') {
+    var pool = [];
+    walk(document, 0, function (el) {
+      if (el.matches && el.matches('button, [role="button"], mat-icon-button, gem-icon-button')) pool.push(el);
+      return false;
+    });
+    var seen = pool.map(labelOf).filter(Boolean).slice(0, 40);
+    // Exact match first: it is the only one ever observed to work. The scan is
+    // the drift fallback, so a rename, a restructure or a localised label does
+    // not have to be a code change before the upload path works again.
+    var exact = document.querySelector("button[aria-label='Upload and tools']");
+    var target = visible(exact) ? exact : null;
+    var how = target ? 'exact aria-label match' : null;
+    for (var i = 0; !target && i < pool.length; i++) {
+      if (visible(pool[i]) && /upload|attach/i.test(labelOf(pool[i]))) {
+        target = pool[i];
+        how = 'visible control named ' + JSON.stringify(labelOf(pool[i]));
+      }
+    }
+    if (target) target.click();
+    if (!target) how = 'no visible upload or attach control found';
+    return { clicked: !!target, how: how, candidates: seen };
+  }
+
+  if (mode === 'click-upload-item') {
+    var pool = [];
+    walk(document, 0, function (el) {
+      if (el.matches && el.matches('[role="menuitem"], [role="menuitemcheckbox"], mat-menu-item, mat-list-item, button, a, div, span')) pool.push(el);
+      return false;
+    });
+    var seen = pool.map(labelOf).filter(Boolean).slice(0, 60);
+    var target = null;
+    var how = null;
+    var cands = [];
+    for (var i = 0; i < pool.length; i++) {
+      var el = pool[i];
+      if (!visible(el)) continue;
+      // Prefix matching, not equality: a real row carries a badge, a count or a
+      // nested label, so "Upload files" never compares equal to the whole row.
+      if (/^upload|^attach|^add file|^add image|^insert/i.test(labelOf(el))) cands.push(el);
+    }
+    // Click the innermost match. A wrapper row's textContent starts with the
+    // same prefix as the control nested inside it, so comparing labels cannot
+    // separate them; filtering to the candidates that contain no other
+    // candidate is what lands the click on the element with the real handler.
+    var leaves = cands.filter(function (el) {
+      return !cands.some(function (other) {
+        return other !== el && typeof el.contains === 'function' && el.contains(other);
+      });
+    });
+    target = leaves.length ? leaves[0] : null;
+    if (target) how = 'menu item ' + JSON.stringify(labelOf(target));
+    if (target) target.click();
+    return { clicked: !!target, how: how, candidates: seen };
+  }
+
+  return { clicked: false, how: 'unknown mode ' + mode, candidates: [] };
+})`;
+
+      const evaluateHelper = async (mode, returnByValue) => {
+        const { result, exceptionDetails } = await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+          expression: "(" + PAGE_HELPER_JS + ")('" + mode + "')",
+          returnByValue: !!returnByValue,
+          objectGroup: "timepass-file-upload"
+        });
+        if (exceptionDetails) {
+          const ex = exceptionDetails.exception;
+          throw new Error("page helper '" + mode + "' threw: " + ((ex && (ex.description || ex.value)) || exceptionDetails.text));
+        }
+        return result;
+      };
+
+      // A handle to the input, or null. Resolving it to a nodeId is optional:
+      // DOM.setFileInputFiles also takes an objectId directly, so both paths are
+      // attempted rather than betting the upload on one of them.
+      const findFileInput = async () => {
+        const res = await evaluateHelper("find-input", false);
+        return res && res.objectId ? res.objectId : null;
+      };
+
+      // Declared here, beside the helper that closes over it. It used to be
+      // declared inside the try below, which left setFilesOn referencing a
+      // binding that did not enclose it, so every upload that reached the
+      // resolution path threw a ReferenceError instead of setting the files.
+      // Hoisting it here keeps the behaviour: the validation still runs before
+      // the debugger is attached, because the attach is further down inside try.
+      const filePaths = Array.isArray(payload.filePaths)
+        ? payload.filePaths
+        : (payload.filePath ? [payload.filePath] : []);
+
+      const setFilesOn = async (objectId) => {
+        let nodeId = 0;
         try {
-          const filePaths = Array.isArray(payload.filePaths)
-            ? payload.filePaths
-            : (payload.filePath ? [payload.filePath] : []);
-          if (filePaths.length === 0) {
-            throw new Error('file_upload requires payload.filePath or payload.filePaths');
-          }
-          
-          // Step 1: Attach debugger
+          ({ nodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.requestNode", { objectId }));
+        } catch { /* requestNode is best-effort; the objectId path below still works */ }
+        if (nodeId) {
+          await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", { files: filePaths, nodeId });
+        } else {
+          await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", { files: filePaths, objectId });
+        }
+      };
+
+      const finish = async (via) => {
+        try {
+          await chrome.debugger.sendCommand(debuggee, "Runtime.releaseObjectGroup", { objectGroup: "timepass-file-upload" });
+        } catch { /* the group is dropped with the execution context anyway */ }
+        await chrome.debugger.detach(debuggee);
+        debuggerAttached = false;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            id,
+            success: true,
+            response: { success: true, result: "file uploaded (" + via + ")", trace }
+          }));
+        }
+      };
+
+      try {
+        // Validated here rather than at the declaration so the failure keeps
+        // reporting through this handler's own reply, exactly as before, and
+        // still fires before the debugger is attached.
+        if (filePaths.length === 0) {
+          throw new Error('file_upload requires payload.filePath or payload.filePaths');
+        }
+
         try {
           await chrome.debugger.attach(debuggee, "1.3");
           debuggerAttached = true;
         } catch (attachErr) {
           throw new Error('Failed to attach debugger: ' + attachErr.message + '. Make sure Chrome DevTools is closed.', { cause: attachErr });
         }
-        
-        // Step 2: Get document root
-        const { root } = await chrome.debugger.sendCommand(debuggee, "DOM.getDocument");
-        
-        // Step 3: Try to find file input via DOM.querySelector (light DOM)
-        const { nodeId: lightDomNodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
-          nodeId: root.nodeId,
-          selector: 'input[type="file"]'
-        });
-        
-        if (lightDomNodeId) {
-          // File input found in light DOM, set file directly
-          await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-            files: filePaths,
-            nodeId: lightDomNodeId
-          });
-          await chrome.debugger.detach(debuggee);
-          
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ id, success: true, response: { success: true, result: 'file uploaded (light DOM)' } }));
-          }
+
+        // Priming the DOM agent is not needed to reach the input any more, but
+        // it keeps node resolution on the same warm path the rest of the
+        // extension's debugger use relies on.
+        await chrome.debugger.sendCommand(debuggee, "DOM.getDocument");
+
+        // 1. An input already on the page needs no menu at all.
+        let objectId = await findFileInput();
+        if (objectId) {
+          await setFilesOn(objectId);
+          note("input", "found a file input already present in the page");
+          await finish("direct search");
           return;
         }
-        
-        // Step 4: File input not in light DOM, search shadow DOM via Runtime.evaluate
-        const { result: shadowResult } = await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
-          expression: `
-            (function() {
-              function search(root) {
-                const inputs = root.querySelectorAll('input[type="file"]');
-                if (inputs.length > 0) return inputs[0];
-                const all = root.querySelectorAll('*');
-                for (const el of all) {
-                  if (el.shadowRoot) {
-                    const found = search(el.shadowRoot);
-                    if (found) return found;
-                  }
-                }
-                return null;
-              }
-              const input = search(document);
-              if (!input) return null;
-              input.setAttribute('data-timepass-target', 'true');
-              return 'found';
-            })()
-          `,
-          returnByValue: true
-        });
-        
-        if (shadowResult.value === 'found') {
-          // Found in shadow DOM, now find it via the attribute we set
-          const { nodeId: shadowNodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
-            nodeId: root.nodeId,
-            selector: 'input[type="file"][data-timepass-target="true"]'
-          });
-          
-          if (shadowNodeId) {
-            await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-              files: filePaths,
-              nodeId: shadowNodeId
-            });
-            await chrome.debugger.detach(debuggee);
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ id, success: true, response: { success: true, result: 'file uploaded (shadow DOM)' } }));
-            }
-            return;
-          }
+        note("input", "no file input in the page (light DOM or any open shadow root)");
+
+        // 2. Open the attachment menu, which is what creates the input.
+        const open = (await evaluateHelper("open-menu", true)).value || {};
+        note("open-menu", "clicked=" + !!open.clicked + (open.how ? " via " + open.how : "") +
+          "; visible candidates=" + JSON.stringify(open.candidates || []));
+        if (!open.clicked) {
+          throw new Error('Upload trigger not found. ' + trace.join(" | "));
         }
-        
-        // Step 5: File input not found in DOM, click upload button to reveal it
-        const { result: clickResult } = await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
-          expression: `
-            (function() {
-              const btn = document.querySelector("button[aria-label='Upload and tools']");
-              if (!btn) return 'button not found';
-              btn.click();
-              return 'clicked';
-            })()
-          `,
-          returnByValue: true
-        });
-        
-        if (clickResult.value !== 'clicked') {
-          throw new Error('Upload button not found: ' + clickResult.value);
-        }
-        
-        // Step 6: Wait for menu to render
         await new Promise(r => setTimeout(r, 1500));
-        
-        // Step 7: Search for file input again after menu opens
-        const { result: afterClickResult } = await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
-          expression: `
-            (function() {
-              function search(root) {
-                const inputs = root.querySelectorAll('input[type="file"]');
-                if (inputs.length > 0) return inputs[0];
-                const all = root.querySelectorAll('*');
-                for (const el of all) {
-                  if (el.shadowRoot) {
-                    const found = search(el.shadowRoot);
-                    if (found) return found;
-                  }
-                }
-                return null;
-              }
-              const input = search(document);
-              if (!input) return null;
-              input.setAttribute('data-timepass-target', 'true');
-              return 'found';
-            })()
-          `,
-          returnByValue: true
-        });
-        
-        if (afterClickResult.value === 'found') {
-          const { nodeId: afterClickNodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
-            nodeId: root.nodeId,
-            selector: 'input[type="file"][data-timepass-target="true"]'
-          });
-          
-          if (afterClickNodeId) {
-            await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-              files: filePaths,
-              nodeId: afterClickNodeId
-            });
-            await chrome.debugger.detach(debuggee);
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ id, success: true, response: { success: true, result: 'file uploaded (after click)' } }));
-            }
-            return;
-          }
+
+        objectId = await findFileInput();
+        if (objectId) {
+          await setFilesOn(objectId);
+          note("input", "file input appeared once the menu was opened");
+          await finish("after opening the menu");
+          return;
         }
-        
-        // Step 8: Still not found, try clicking "Upload files" menu item
-        await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
-          expression: `
-            (function() {
-              const items = document.querySelectorAll('[role="menuitem"], button, div, span, mat-list-item, a');
-              for (const item of items) {
-                const text = item.textContent.trim();
-                if ((text === 'Upload files' || text === 'Upload from device') && item.offsetParent !== null) {
-                  item.click();
-                  return 'clicked: ' + text;
-                }
-              }
-              return 'menu item not found';
-            })()
-          `,
-          returnByValue: true
-        });
-        
-        // Step 9: Wait for file input to appear
+        note("input", "still no file input after opening the menu");
+
+        // 3. Open the menu's own upload entry, which is what creates the input.
+        const menu = (await evaluateHelper("click-upload-item", true)).value || {};
+        note("menu-item", "clicked=" + !!menu.clicked + (menu.how ? " via " + menu.how : "") +
+          "; menu candidates=" + JSON.stringify(menu.candidates || []));
         await new Promise(r => setTimeout(r, 1500));
-        
-        // Step 10: Final search for file input
-        const { result: finalResult } = await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
-          expression: `
-            (function() {
-              function search(root) {
-                const inputs = root.querySelectorAll('input[type="file"]');
-                if (inputs.length > 0) return inputs[0];
-                const all = root.querySelectorAll('*');
-                for (const el of all) {
-                  if (el.shadowRoot) {
-                    const found = search(el.shadowRoot);
-                    if (found) return found;
-                  }
-                }
-                return null;
-              }
-              const input = search(document);
-              if (!input) return null;
-              input.setAttribute('data-timepass-target', 'true');
-              return 'found';
-            })()
-          `,
-          returnByValue: true
-        });
-        
-        if (finalResult.value !== 'found') {
-          throw new Error('File input not found after all attempts (light DOM, shadow DOM, button click, menu click)');
+
+        objectId = await findFileInput();
+        if (!objectId) {
+          throw new Error('File input not found after opening the upload menu and its items. ' +
+            trace.join(" | "));
         }
-        
-        const { nodeId: finalNodeId } = await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
-          nodeId: root.nodeId,
-          selector: 'input[type="file"][data-timepass-target="true"]'
-        });
-        
-        if (!finalNodeId) {
-          throw new Error('Could not get nodeId for file input');
-        }
-        
-        await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
-          files: filePaths,
-          nodeId: finalNodeId
-        });
-        
-        // Step 11: Detach debugger
-        await chrome.debugger.detach(debuggee);
-        debuggerAttached = false;
-        
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ id, success: true, response: { success: true, result: 'file uploaded (final attempt)' } }));
-        }
+        await setFilesOn(objectId);
+        note("input", "file input appeared after clicking the menu item");
+        await finish("after clicking the menu item");
       } catch (err) {
         // Detach on error
         if (debuggerAttached) {
           try { await chrome.debugger.detach({ tabId: tab.id }); } catch { /* ignore */ }
         }
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ id, success: true, response: { success: false, error: err.message } }));
+          ws.send(JSON.stringify({ id, success: true, response: { success: false, error: err.message, trace } }));
         }
       }
       return;
@@ -648,22 +1068,39 @@ async function handleServerMessage(message) {
 
     tab = await getOrCreateGeminiTab(payload?.url);
 
-    // Arm the freeze watchdog for the live ask path. Only a confirmed freeze
-    // (no heartbeat at all) triggers a reload, so a slow but healthy long
-    // generation is never interrupted.
+    // Arm the freeze watchdog for the live ask path. Only a *confirmed* freeze
+    // (consecutive silent windows, not a single gap) triggers a reload, so a
+    // slow but healthy long generation is never interrupted. The turn carries
+    // the caller's own budget so the silence window can be sized against it
+    // rather than against one global constant.
     if (action === "inject_and_send") {
-      activeTurn = { id, tabId: tab.id, startedAt: Date.now(), lastBeatAt: Date.now(), handled: false };
+      activeTurn = {
+        id,
+        tabId: tab.id,
+        startedAt: Date.now(),
+        lastBeatAt: Date.now(),
+        budgetMs: turnBudgetMs(payload, message),
+        handled: false
+      };
     }
 
     // Send action to content script in the Gemini tab with retry
+    phase = "sending the action to the content script";
     const response = await sendMessageWithRetry(tab.id, { id, action, payload });
 
     // Send result back to server
+    phase = "replying to the host";
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ id, success: true, response }));
     }
   } catch (err) {
-    const tabDetails = tab ? `Tab URL: ${tab.url}, Status: ${tab.status}` : "No Tab found";
+    // Say what actually happened. "No Tab found" was a lie whenever
+    // getOrCreateGeminiTab threw: `tab` was null because resolution failed, not
+    // because no tabs existed, and the message sent readers looking for a
+    // missing tab instead of a load timeout.
+    const tabDetails = tab
+      ? describeTabState(tab)
+      : `no tab resolved (failed while ${phase})`;
     console.error(`[Timepass MV3] Action dispatch error. ${tabDetails}. Details:`, err);
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ id, success: false, error: `${err.message} (${tabDetails})` }));
@@ -695,12 +1132,120 @@ setInterval(() => {
 // that would notice is frozen along with the page. So the watchdog lives here,
 // in a separate JS context that stays responsive, and decides from silence.
 // Silence is the signal: a slow-but-alive page keeps beating, a frozen one
-// cannot. Only a confirmed freeze reloads, so a long healthy answer is never
-// interrupted.
-const FREEZE_RELOAD_MS = 20000;
+// cannot.
+//
+// The gap this region is defending against is subtle. Silence is not proof of
+// death: a missed beat, a GC pause, a stalled event loop or a slow worker
+// dispatch all look identical to a freeze from out here. The original design
+// reloaded on a single 20s gap, so ANY such hiccup destroyed a live answer and
+// forced it through the fragile recovery path (#3). Two rules fix that without
+// weakening freeze detection much:
+//
+//   1. The silence window is derived from *this turn's* budget, not a global
+//      constant. A caller that allowed 20s must get its recovery inside 20s;
+//      a caller that allowed 10 minutes should not have a frozen tab left
+//      sitting there.
+//   2. A reload needs `requiredWindows` CONSECUTIVE silent windows. A single
+//      gap is treated as a suspicion, not a verdict: if the page was only
+//      briefly unobservable it resumes beating, the counter resets, and the
+//      answer is never touched.
+//
+// TRADE-OFF, stated plainly: because a verdict now needs two full windows,
+// worst-case detection is ~2x the window instead of 1x. At the default 60s
+// budget that is ~30s of silence (plus up to one 2s poll tick) versus the old
+// 20-22s. A genuinely frozen tab is still caught well inside any sane caller's
+// budget, and the alternative -- reloading on one gap -- is what caused the
+// data loss in the first place. The window floor/cap below keep the worst case
+// bounded to ~40s even for very long turns.
+const FREEZE_POLICY = {
+  // Silence window = budget / budgetDivisor, clamped to this range.
+  minWindowMs: 8000,
+  maxWindowMs: 20000,
+  budgetDivisor: 4,
+  // Used when the caller declared no budget at all.
+  defaultBudgetMs: 60000,
+  // Consecutive silent windows required before a reload is considered.
+  requiredWindows: 2,
+  // A heartbeat `ts` further than this from our own clock is not trusted.
+  maxBeatSkewMs: 300000
+};
 
 /** The turn currently being observed, or null when idle. */
 let activeTurn = null;
+
+function clamp(value, lo, hi) {
+  return Math.min(hi, Math.max(lo, value));
+}
+
+/**
+ * The caller's budget for this turn, in ms. The adapter puts `timeoutMs` on the
+ * content-script payload and the driver puts it on the envelope, so accept
+ * either; fall back to the policy default when neither is a usable number.
+ */
+function turnBudgetMs(payload, envelope) {
+  const candidates = [payload && payload.timeoutMs, envelope && envelope.timeoutMs];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return FREEZE_POLICY.defaultBudgetMs;
+}
+
+/**
+ * The silence window for one turn. Sizing it from the budget keeps the
+ * watchdog's verdict inside the caller's patience: 2 * window stays below the
+ * budget for every budget at or above ~16s, so recovery still beats the driver
+ * giving up.
+ */
+function freezeWindowMs(turn, policy) {
+  const p = policy || FREEZE_POLICY;
+  const budget = Number(turn && turn.budgetMs);
+  const base = Number.isFinite(budget) && budget > 0 ? budget : p.defaultBudgetMs;
+  return clamp(Math.floor(base / p.budgetDivisor), p.minWindowMs, p.maxWindowMs);
+}
+
+/**
+ * Record a heartbeat against a turn. Pure apart from its arguments.
+ *
+ * The page stamps its own `ts`, and that is the only moment we know for
+ * certain the page was alive. Crediting the *received* time instead (the old
+ * behaviour) invents liveness the page never proved: when the worker is busy
+ * and a beat emitted at T arrives at T+30s, receive-time says "alive at T+30s"
+ * while the page may have frozen at T+1s, so a real freeze is detected late.
+ * Using the emitted time is both more truthful and safer here. It is clamped to
+ * never exceed our own clock, so a bogus future `ts` cannot mute the watchdog
+ * for the life of the turn, and ignored entirely if implausible.
+ */
+function noteHeartbeat(turn, message, receivedAt, policy) {
+  if (!turn) return turn;
+  const p = policy || FREEZE_POLICY;
+  const ts = Number(message && message.ts);
+  const plausible = Number.isFinite(ts) && ts > 0 && Math.abs(receivedAt - ts) <= p.maxBeatSkewMs;
+  const emittedAt = plausible ? Math.min(ts, receivedAt) : receivedAt;
+  return {
+    ...turn,
+    // Guard against out-of-order delivery walking lastBeatAt backwards.
+    lastBeatAt: Math.max(turn.lastBeatAt, emittedAt),
+    lastBeatLagMs: Math.max(0, receivedAt - emittedAt)
+  };
+}
+
+/**
+ * What the watchdog should do about a turn that has gone quiet. Pure: `now`
+ * is passed in so the policy is directly testable without a fake clock.
+ */
+function decideFreezeAction(turn, now, policy) {
+  const p = policy || FREEZE_POLICY;
+  if (!turn || turn.handled) return { action: "none", reason: "no-turn" };
+
+  const windowMs = freezeWindowMs(turn, p);
+  const silenceMs = Math.max(0, now - turn.lastBeatAt);
+  const missedWindows = Math.floor(silenceMs / windowMs);
+  if (missedWindows < p.requiredWindows) {
+    return { action: "none", reason: "awaiting-corroboration", silenceMs, windowMs, missedWindows };
+  }
+  return { action: "reload", reason: "confirmed-freeze", silenceMs, windowMs, missedWindows };
+}
 
 // Relays messages from content script back to server
 chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
@@ -708,7 +1253,7 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   // but alive keeps sending these; a tab with a blocked main thread goes
   // silent, and that silence is what the watchdog acts on.
   if (message.type === "turn_heartbeat") {
-    if (activeTurn) activeTurn.lastBeatAt = Date.now();
+    activeTurn = noteHeartbeat(activeTurn, message, Date.now(), FREEZE_POLICY);
     return;
   }
   if (message.type === "turn_complete") {
@@ -726,13 +1271,12 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
 });
 
 async function handleFreezeWatchdog() {
-  if (!activeTurn || activeTurn.handled) return;
-  if (Date.now() - activeTurn.lastBeatAt < FREEZE_RELOAD_MS) return;
+  const decision = decideFreezeAction(activeTurn, Date.now(), FREEZE_POLICY);
+  if (decision.action !== "reload") return;
 
   const turn = activeTurn;
   turn.handled = true;
-  const silentFor = Date.now() - turn.lastBeatAt;
-  console.warn(`[Timepass MV3] Gemini tab silent for ${silentFor}ms with a turn in flight; reloading to recover the saved response.`);
+  console.warn(`[Timepass MV3] Gemini tab silent for ${decision.silenceMs}ms across ${decision.missedWindows} windows (window ${decision.windowMs}ms) with a turn in flight; reloading to recover the saved response.`);
 
   try {
     await chrome.tabs.reload(turn.tabId);
@@ -813,4 +1357,34 @@ async function writeCookies(domain, payload) {
       expirationDate: c.expirationDate
     });
   }
+}
+
+// --- Test seam ---------------------------------------------------------------
+// The pure decision helpers are published onto globalThis so the vitest suite can
+// drive them directly. An MV3 service worker is evaluated once into its own
+// scope and cannot use ESM `export`, so this inert global is the harness. It is
+// namespaced (`__timepassInternals`) and the assignment is a harmless no-op in
+// production.
+if (typeof globalThis !== "undefined") {
+  globalThis.__timepassInternals = {
+    decideFreezeAction,
+    freezeWindowMs,
+    noteHeartbeat,
+    turnBudgetMs,
+    clamp,
+    FREEZE_POLICY,
+    tabIsReady,
+    compareGeminiTabs,
+    pickGeminiTab,
+    describeTabState,
+    TAB_LOAD_BUDGET_MS,
+    withBudget,
+    runningBuildId,
+    DISPATCH_ACTIONS,
+    CONTENT_FORWARDED_ACTIONS,
+    INTERNAL_ACTIONS,
+    KNOWN_ACTIONS,
+    BRIDGE_PROTOCOL_VERSION,
+    ASYNC_ACTIONS
+  };
 }
