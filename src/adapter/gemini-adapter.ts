@@ -10,10 +10,13 @@ import { SendButtonHandler } from '../components/send-button.js';
 import { ModelPickerHandler } from '../components/model-picker.js';
 import { ImageUploaderHandler } from '../components/image-uploader.js';
 import { ResponseStreamerHandler } from '../components/response-streamer.js';
-import { GeminiOptions, GeminiResponse, StreamChunk } from './types.js';
+import { GeminiOptions, GeminiResponse, StreamChunk, AnswerReplyEnvelope, isCompletedAnswer } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/** Conversation reported when a reply carries no id of its own. */
+const DEFAULT_CHAT_ID = 'https://gemini.google.com/app';
 
 /**
  * Headroom above the page-side budget before the adapter abandons a stream.
@@ -74,14 +77,7 @@ export class GeminiAdapter {
       payload.url = 'https://gemini.google.com/app';
     }
 
-    const res = await this.driver.executeAction<{
-      success: boolean;
-      turnComplete: boolean;
-      text?: string;
-      chatId?: string;
-      partial?: boolean;
-      error?: string;
-    }>({
+    const res = await this.driver.executeAction<AnswerReplyEnvelope>({
       action: 'inject_and_send',
       payload,
       // The driver honours the *top-level* budget, so a caller's timeoutMs has
@@ -90,12 +86,22 @@ export class GeminiAdapter {
       timeoutMs: opts.timeoutMs,
     });
 
-    if (res.success && res.data && res.data.success && res.data.turnComplete) {
+    // Judge the reply on its own evidence, not on one flag a producer may have
+    // forgotten to set. This used to require `turnComplete` unconditionally, so
+    // a recovered answer whose envelope omitted it — the exact shape a stale
+    // extension build sent, and the shape `recover_last_response` still sends —
+    // was discarded and reported as an error, throwing away an answer Gemini
+    // had already finished and the user had already paid for. See issue #5.
+    if (res.success && res.data && isCompletedAnswer(res.data)) {
       return {
-        chatId: res.data.chatId || 'https://gemini.google.com/app',
+        chatId: res.data.chatId || DEFAULT_CHAT_ID,
         text: res.data.text || '',
         images: [],
-        partial: res.data.partial === true
+        partial: res.data.partial === true,
+        // Surfaced rather than swallowed: the freeze watchdog and the recovery
+        // path both answer with `recovered: true`, and the tool layer renders a
+        // banner for it that ask() previously made unreachable.
+        recovered: res.data.recovered === true
       };
     }
 
@@ -128,21 +134,16 @@ export class GeminiAdapter {
   async collectLastResponse(options?: { actionId?: string; timeoutMs?: number }): Promise<GeminiResponse> {
     const actionId = options?.actionId ?? this.abandonedAction?.id;
 
-    const late = await this.driver.collectLate<{
-      success?: boolean;
-      turnComplete?: boolean;
-      text?: string;
-      chatId?: string;
-      partial?: boolean;
-      error?: string;
-    }>(actionId);
+    const late = await this.driver.collectLate<AnswerReplyEnvelope>(actionId);
 
-    if (late && late.success && late.data && typeof late.data.text === 'string' && late.data.text.length > 0) {
+    // Same predicate as the ask path, so a recovered answer is recognised the
+    // same way however it was obtained.
+    if (late && late.success && late.data && isCompletedAnswer(late.data)) {
       if (this.abandonedAction && (!actionId || actionId === this.abandonedAction.id)) {
         this.abandonedAction = null;
       }
       return {
-        chatId: late.data.chatId || 'https://gemini.google.com/app',
+        chatId: late.data.chatId || DEFAULT_CHAT_ID,
         text: late.data.text,
         images: [],
         recovered: true,
@@ -155,24 +156,23 @@ export class GeminiAdapter {
     // completed answer even though no reply reached the socket. Nothing is
     // re-asked. The driver adds its own grace on top of this budget.
     const budgetMs = options?.timeoutMs ?? 45000;
-    const reread = await this.driver.executeAction<{
-      success: boolean;
-      recovered?: boolean;
-      text?: string;
-      chatId?: string;
-      error?: string;
-    }>({
+    const reread = await this.driver.executeAction<AnswerReplyEnvelope>({
       action: 'recover_last_response',
       payload: { timeoutMs: budgetMs },
       timeoutMs: budgetMs
     });
 
-    if (reread.success && reread.data && reread.data.success && typeof reread.data.text === 'string') {
+    // The page's own recovery reply omits `turnComplete` on the builds that
+    // predate the shared envelope, and it is the only producer that still does,
+    // so it is accepted on `recovered` + real text. An empty recovery is not an
+    // answer and now reports as "nothing to collect" instead of an empty string
+    // dressed up as one.
+    if (reread.success && reread.data && isCompletedAnswer(reread.data)) {
       if (this.abandonedAction && (!actionId || actionId === this.abandonedAction.id)) {
         this.abandonedAction = null;
       }
       return {
-        chatId: reread.data.chatId || 'https://gemini.google.com/app',
+        chatId: reread.data.chatId || DEFAULT_CHAT_ID,
         text: reread.data.text,
         images: [],
         recovered: true,
@@ -201,15 +201,7 @@ export class GeminiAdapter {
     let chatId = 'https://gemini.google.com/app';
     let completed = false;
 
-    const actionPromise = this.driver.executeAction<{
-      success: boolean;
-      turnComplete: boolean;
-      text?: string;
-      chatId?: string;
-      error?: string;
-      recovered?: boolean;
-      partial?: boolean;
-    }>({
+    const actionPromise = this.driver.executeAction<AnswerReplyEnvelope>({
       action: 'inject_and_send',
       payload,
       timeoutMs: opts.timeoutMs,

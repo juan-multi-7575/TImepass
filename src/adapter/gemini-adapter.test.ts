@@ -240,6 +240,87 @@ describe('GeminiAdapter.collectLastResponse', () => {
   });
 });
 
+describe('completed answers (issue #5)', () => {
+  const adapters: GeminiAdapter[] = [];
+
+  afterEach(() => {
+    for (const adapter of adapters.splice(0)) {
+      adapter.close();
+    }
+  });
+
+  /**
+   * Adapter whose driver replies to `inject_and_send` with one fixed payload —
+   * the envelope exactly as a producer put it on the wire.
+   */
+  function adapterAnswering(data: unknown): GeminiAdapter {
+    const adapter = new GeminiAdapter();
+    adapters.push(adapter);
+    (adapter as any).driver = {
+      executeAction: async () => ({ success: true, data }) as ActionResult<any>,
+      collectLate: async () => null,
+      close: async () => {}
+    };
+    return adapter;
+  }
+
+  it('returns a recovered answer whose envelope omitted turnComplete', async () => {
+    // The shape a stale extension build sent, and the one `recover_last_response`
+    // still sends: a finished answer with no `turnComplete`. It used to be
+    // classified as a failure, so the user got "Failed to get Gemini response."
+    // instead of the correct text Gemini had already paid for.
+    const adapter = adapterAnswering({
+      success: true, recovered: true, text: 'Blue', chatId: 'https://gemini.google.com/app/xyz'
+    });
+
+    await expect(adapter.ask('what colour?')).resolves.toMatchObject({
+      text: 'Blue',
+      chatId: 'https://gemini.google.com/app/xyz'
+    });
+  });
+
+  it('flags that answer as recovered, so the tool layer can say so', async () => {
+    const adapter = adapterAnswering({ success: true, recovered: true, text: 'Blue' });
+
+    await expect(adapter.ask('what colour?')).resolves.toMatchObject({
+      text: 'Blue',
+      recovered: true
+    });
+  });
+
+  it('keeps accepting the canonical envelope unchanged', async () => {
+    const adapter = adapterAnswering({
+      success: true, turnComplete: true, text: 'Tokyo', chatId: 'chat-1'
+    });
+
+    await expect(adapter.ask('capital?')).resolves.toMatchObject({
+      text: 'Tokyo',
+      chatId: 'chat-1',
+      recovered: false
+    });
+  });
+
+  it('still rejects a turn that is merely in flight', async () => {
+    // Tolerance must not turn silence about completion into completion: this
+    // reply says the turn has NOT finished, so there is no answer to return.
+    const adapter = adapterAnswering({ success: true, turnComplete: false, text: 'partial so far' });
+
+    await expect(adapter.ask('long prompt')).rejects.toThrow(/Failed to get Gemini response/);
+  });
+
+  it('still rejects a recovered envelope with no text in it', async () => {
+    const adapter = adapterAnswering({ success: true, recovered: true, text: '' });
+
+    await expect(adapter.ask('long prompt')).rejects.toThrow(/Failed to get Gemini response/);
+  });
+
+  it('still rejects an explicit failure envelope', async () => {
+    const adapter = adapterAnswering({ success: false, error: 'Input editor not found' });
+
+    await expect(adapter.ask('hello')).rejects.toThrow('Input editor not found');
+  });
+});
+
 describe('partial answers', () => {
   const adapters: GeminiAdapter[] = [];
 
