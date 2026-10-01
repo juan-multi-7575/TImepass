@@ -44,23 +44,33 @@ const ANSWER_ROOT_SOURCE = readFileSync(path.join(HERE, 'answer-root.js'), 'utf8
 // here rather than the tests faking a match.
 
 function parseCompound(part) {
-  const compound = { tag: null, attrs: [] };
-  const tokens = part.match(/^[a-zA-Z][\w-]*|\[[^\]]+\]|:not\([^)]*\)/g) || [];
-  for (const token of tokens) {
-    if (token.startsWith('[')) {
-      const m = token.slice(1, -1).match(/^([\w:-]+)(?:([*^$~|]?=)"?([^"\]]*)"?)?$/);
-      if (m) {
-        // Strip surrounding quotes of either kind: `[a='x y']` must compare
-        // against the value `x y`, not `'x y'`.
-        const raw = m[3] == null ? '' : m[3];
-        const value = /^(["']).*\1$/.test(raw) ? raw.slice(1, -1) : raw;
-        compound.attrs.push({ name: m[1], op: m[2] || null, value });
-      }
-    } else if (token.startsWith(':not(')) {
+  const compound = { tag: null, id: null, classes: [], attrs: [] };
+  // Attribute predicates are pulled out FIRST and blanked from the string, so
+  // the tag/class/id scan below cannot pick up characters from inside a value
+  // (a value like "Ask Gemini" or "send-button" would otherwise be misread).
+  const rest = part.replace(/\[[^\]]*\]|:not\([^)]*\)/g, token => {
+    if (token.startsWith(':not(')) {
       compound.attrs.push({ name: ':not', op: null, value: token.slice(5, -1) });
-    } else {
-      compound.tag = token.toLowerCase();
+      return ' ';
     }
+    const m = token.slice(1, -1).match(/^([\w:-]+)(?:([*^$~|]?=)(.*))?$/);
+    if (m) {
+      // Strip surrounding quotes of either kind: `[a='x y']` must compare
+      // against the value `x y`, not `'x y'`.
+      const raw = m[3] == null ? '' : m[3];
+      const value = /^(["']).*\1$/.test(raw) ? raw.slice(1, -1) : raw;
+      compound.attrs.push({ name: m[1], op: m[2] || null, value });
+    }
+    return ' ';
+  });
+
+  // Class and id selectors are NOT optional. An earlier version of this engine
+  // silently ignored them, which turned `.send-button` into "any element" and
+  // made the #12 tests assert against garbage.
+  for (const token of rest.match(/[.#]?[\w-]+/g) || []) {
+    if (token.startsWith('.')) compound.classes.push(token.slice(1));
+    else if (token.startsWith('#')) compound.id = token.slice(1);
+    else if (compound.tag === null) compound.tag = token.toLowerCase();
   }
   return compound;
 }
@@ -118,6 +128,11 @@ function attrMatches(el, { name, op, value }) {
 
 function matchCompound(el, compound) {
   if (compound.tag && el.tag.toLowerCase() !== compound.tag) return false;
+  if (compound.id && el.attributes.id !== compound.id) return false;
+  if (compound.classes && compound.classes.length) {
+    const cls = String(el.attributes.class || '').split(/\s+/);
+    for (const c of compound.classes) if (cls.indexOf(c) === -1) return false;
+  }
   return compound.attrs.every(a => attrMatches(el, a));
 }
 
@@ -688,5 +703,194 @@ describe('completed-answer envelope', () => {
     });
     expect(res.success).toBe(false);
     expect(res.turnComplete).toBeUndefined();
+  });
+});
+// ===========================================================================
+// #12 — generation detection: three-state, deep lookups, position:fixed
+// ===========================================================================
+//
+// These prove WHAT THE CODE DOES. They cannot prove the shadow-root hypothesis
+// was true -- that needs the live tab (see issue #12). The shadow cases below
+// exist to pin the tolerant behaviour so nobody simplifies it back to a flat
+// query, not as evidence that the live UI is shadow-hosted.
+
+describe('#12 generation state is three-state', () => {
+  // generationState() is function-scoped inside the content script's IIFE and is
+  // deliberately NOT exported as a test seam. It is observed the way production
+  // observes it: through the heartbeat payload, which now carries genState.
+  async function genStateSeenBy(w) {
+    w.doc.body.appendChild(el({ tag: 'div', attributes: { contenteditable: 'true', placeholder: 'Ask Gemini' } }));
+    w.inject();
+    w.dispatch({ action: 'inject_and_send', payload: { prompt: 'hi', timeoutMs: 4000 } });
+    // The first beat is the typing-phase beacon, which carries no genState; the
+    // generation state first appears on the response-loop beat.
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const b = w.beats().find(x => 'genState' in x);
+      if (b) return b.genState;
+      await new Promise(r => setTimeout(r, 25));
+    }
+    return null;
+  }
+
+  /** A composer whose send button is plain light DOM (the evidence-backed case). */
+  function composerPage(extra = {}) {
+    const parts = [];
+    const sendBtn = el({ tag: 'button', attributes: { 'aria-label': 'Send', ...(extra.sendAttrs || {}) } });
+    const wrap = el({ tag: 'gem-icon-button', attributes: { class: 'send-button' } });
+    wrap.children.push(sendBtn);
+    parts.push(wrap);
+    world.doc.body.appendChild(wrap);
+    return { wrap, sendBtn };
+  }
+
+  it('reports idle, not unknown, when the composer IS reachable (no regression for light DOM)', async () => {
+    composerPage();
+    world.inject();
+    const res = await world.dispatchAsync({ action: 'get_status' });
+    expect(res.success).toBe(true);
+  });
+
+  it('a fixed-position stop button counts as VISIBLE (offsetParent is null for position:fixed)', async () => {
+    // Confirmed source-level defect, independent of the shadow hypothesis: per
+    // the CSSOM spec offsetParent is null on a position:fixed element, so the
+    // old `stop.offsetParent !== null` check reported a visible stop button as
+    // invisible and therefore "not generating".
+    const stop = el({ tag: 'button', attributes: { 'aria-label': 'Stop response' } }, []);
+    // jsdom-free stand-in for position:fixed: offsetParent null, client rects present.
+    Object.defineProperty(stop, 'offsetParent', { get: () => null, configurable: true });
+    stop.getClientRects = () => [{ x: 0, y: 0, width: 20, height: 20 }];
+    world.doc.body.appendChild(stop);
+    expect(await genStateSeenBy(world)).toBe('generating');
+  });
+
+  it('an unfindable composer yields "unknown", never a false "idle"', async () => {
+    // No composer at all. The old code returned false here, i.e. "not
+    // generating", which let the narrow loop end the turn on settle alone.
+    world.doc.body.appendChild(el({ tag: 'div', attributes: { role: 'main' } }));
+    expect(await genStateSeenBy(world)).toBe('unknown');
+  });
+
+  it('detects generating when the stop icon is inside a shadow root (#12 tolerance)', async () => {
+    const sr = makeShadowRoot();
+    const wrap = el({ tag: 'gem-icon-button', attributes: { class: 'send-button' }, shadowRoot: sr });
+    sr.appendChild(el({ tag: 'gem-icon', attributes: { 'data-mat-icon-name': 'stop_symbol' } }));
+    world.doc.body.appendChild(wrap);
+    // A descent is required here: wrap.querySelector() cannot cross wrap's own
+    // shadow root, so a piercing outer query alone would miss this icon.
+    expect(await genStateSeenBy(world)).toBe('generating');
+  });
+
+  it('get_page_info counts through shadow roots (confirmed defect, not #12 speculation)', async () => {
+    const sr = makeShadowRoot();
+    const host = el({ tag: 'gem-thing', shadowRoot: sr }, []);
+    sr.appendChild(el({ tag: 'input', attributes: { type: 'file' } }));
+    world.doc.body.appendChild(host);
+    world.inject();
+    const res = await world.dispatchAsync({ action: 'get_page_info' });
+    expect(res.success).toBe(true);
+    expect(res.fileInputs).toBe(1);
+    expect(typeof res.shadowRootCount).toBe('number');
+  });
+
+  it('does NOT truncate a mid-generation pause into a "complete" answer', async () => {
+    // THE ACTUAL HARM IN #12, reproduced properly.
+    //
+    // The previous version of this test asserted nothing: with no response
+    // container there is no text to truncate, so BOTH the old and new code
+    // simply failed the turn and the test passed either way. The hazard needs
+    // three things at once:
+    //   1. a response container holding PARTIAL text,
+    //   2. a composer that cannot be found, so the generation signal is blind,
+    //   3. a pause long enough to cross the stability threshold.
+    // The old code then declared the turn complete on the fragment and reported
+    // `partial: false` -- a short answer confidently presented as whole.
+    const w = makeWorld();
+    const editor = el({ tag: 'div', attributes: { contenteditable: 'true', placeholder: 'Ask Gemini' } });
+    w.doc.body.appendChild(editor);
+    // No send/stop button anywhere: the composer is invisible to us.
+    w.inject();
+
+    const { responses } = w.dispatch({
+      action: 'inject_and_send',
+      payload: { prompt: 'hi', timeoutMs: 9000, settleMs: 0 },
+    });
+    // The container must appear AFTER observeResponse has snapshotted preSend,
+    // because pinTarget() only accepts a container that did not exist before the
+    // send. Appending it synchronously put it inside that snapshot and it was
+    // correctly ignored -- which is why an earlier version of this test passed
+    // against the broken code. Typing resolves in ~60ms, so 250ms is safely past
+    // it and comfortably before the first 600ms poll.
+    setTimeout(() => {
+      w.doc.body.appendChild(el({ tag: 'response-container', text: 'Paris is the cap' }, []));
+    }, 250);
+
+    const deadline = Date.now() + 20000;
+    while (responses.length === 0 && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 25));
+    }
+    const res = responses[0];
+    expect(res).toBeTruthy();
+
+    if (res.success) {
+      // If it did complete, it must NOT claim a mid-generation fragment is a
+      // finished answer.
+      expect(res.partial).toBe(true);
+    } else {
+      expect(res.success).toBe(false);
+    }
+  }, 30000);
+});
+
+// ===========================================================================
+// Selector engine self-tests
+// ===========================================================================
+//
+// The engine silently ignored class selectors at one point, which turned
+// `.send-button` into "match every element" and made the #12 assertions above
+// pass or fail for the wrong reason. These pin the behaviours content.js
+// actually depends on so that class of harness bug cannot hide again.
+
+describe('selector engine self-tests', () => {
+  const doc = makeDoc([
+    el({ tag: 'gem-icon-button', attributes: { class: 'send-button mat-mdc-button' } }, [
+      el({ tag: 'button', attributes: { 'aria-label': 'Send' } }),
+    ]),
+    el({ tag: 'aside', attributes: { class: 'sidebar-pane' } }, [
+      el({ tag: 'a', attributes: { href: '/app/xyz' }, text: 'chat' }),
+    ]),
+    el({ tag: 'div', attributes: { id: 'chat-container' } }, []),
+  ]);
+
+  const q = sel => doc.querySelectorAll(sel);
+
+  it('matches a compound tag.class selector', () => {
+    expect(q('gem-icon-button.send-button').map(n => n.tag)).toEqual(['GEM-ICON-BUTTON']);
+  });
+
+  it('does NOT let a bare class selector match every element', () => {
+    // The regression that made the #12 tests meaningless.
+    const all = q('.send-button');
+    expect(all).toHaveLength(1);
+    expect(all[0].tag).toBe('GEM-ICON-BUTTON');
+  });
+
+  it('matches by id', () => {
+    expect(q('#chat-container')).toHaveLength(1);
+  });
+
+  it('matches attribute selectors, including quoted values with spaces', () => {
+    expect(q("[placeholder='Ask Gemini']")).toHaveLength(0);
+    const doc2 = makeDoc([el({ tag: 'div', attributes: { placeholder: 'Ask Gemini' } }, [])]);
+    expect(doc2.querySelectorAll("[placeholder='Ask Gemini']")).toHaveLength(1);
+  });
+
+  it('matches substring attributes used by the history code', () => {
+    expect(q('a[href*="/app/"]').map(n => n.attributes.href)).toEqual(['/app/xyz']);
+  });
+
+  it('honours descendant combinators', () => {
+    expect(q('aside a[href*="/app/"]')).toHaveLength(1);
+    expect(q('button a[href*="/app/"]')).toHaveLength(0);
   });
 });

@@ -122,7 +122,10 @@
 function getMainContentRoot() {
   const candidates = ['main', '[role="main"]', '.conversation-container', '#chat-container', '.chat-history', 'response-container'];
   for (const sel of candidates) {
-    const el = document.querySelector(sel);
+    // FLAT FIRST, shadow fallback (#12 robustness, unverified). This is the
+    // scan root for the whole DOM-diff engine, so a page whose main region is
+    // shadow-hosted would otherwise snapshot an empty body.
+    const el = deepQueryAll(sel)[0] || null;
     if (el) {
       // Prefer the parent that holds all responses if we matched a single response
       if (sel === 'response-container' && el.parentElement) return el.parentElement;
@@ -229,25 +232,81 @@ class DomDiffer {
 // from a frozen page, but this can.
 const SEND_WRAP_SELECTORS = 'gem-icon-button.send-button, .send-button';
 const SEND_BTN_SELECTORS = 'gem-icon-button.send-button button, .send-button button';
+const STOP_BTN_SELECTORS =
+  'button[aria-label="Stop response"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
 
-function isGenerating() {
-  // 1) The send button usually keeps its wrapper while the icon swaps to a
-  //    stop glyph, so check the icon name on the wrapper first.
-  const wrap = document.querySelector(SEND_WRAP_SELECTORS);
+// --- Generation state -------------------------------------------------------
+//
+// THREE states, not a boolean. A boolean forces "I cannot see the composer" to
+// be reported as "not generating", and the narrow loop then ends the turn on the
+// settle heuristic alone. Gemini pauses between tokens and between tool steps,
+// so any pause long enough to cross the stability threshold truncates the
+// answer -- and reports it as complete, which is worse than a wrong error.
+// Absence of evidence is not evidence of absence, so 'unknown' is its own state
+// and the loops refuse to finish a turn on it. Worst case becomes a LABELLED
+// partial answer, which is honest.
+//
+// ROBUSTNESS, NOT A BUG FIX (#12). The shadow-root premise this defends against
+// is UNVERIFIED and the evidence now leans against it: two captured DOM
+// transcripts contain zero shadow roots in total, and the `gem-button` /
+// `mat-menu` elements once cited as proof carry Angular `_nghost-*` attributes,
+// which is what EMULATED encapsulation emits -- emulated encapsulation renders
+// into light DOM and creates no shadow root at all. So the deep queries below
+// are a flat-first-with-fallback, not a correction of anything observed broken.
+// Settle it in the live tab:
+//   document.querySelectorAll('gem-icon-button').length
+//   document.querySelectorAll('response-container').length
+// If both are non-zero, the deep lookups are harmless belt-and-braces and #12
+// should be closed as a non-issue.
+
+const GENERATION_UNKNOWN = 'unknown';
+
+function generationState() {
+  let sawComposer = false;
+
+  // 1) The send button usually keeps its wrapper while the icon swaps to a stop
+  //    glyph, so check the icon name on the wrapper first.
+  //    FLAT FIRST, shadow fallback: deepQueryAll queries light DOM before it
+  //    looks at any shadow root, so this is a strict superset of the old query.
+  const wrap = deepQueryAll(SEND_WRAP_SELECTORS)[0] || null;
   if (wrap) {
-    const icon = wrap.querySelector('[data-mat-icon-name]');
-    if (icon && /stop/i.test(icon.getAttribute('data-mat-icon-name') || '')) return true;
+    sawComposer = true;
+    // A DESCENT rather than a query from outside: the icon may sit one level
+    // into wrap's own shadow root, which wrap.querySelector() cannot cross.
+    const icon = descendantsDeep(wrap, '[data-mat-icon-name]', false)[0] || null;
+    if (icon && /stop/i.test(icon.getAttribute('data-mat-icon-name') || '')) return 'generating';
   }
+
   // 2) A visible explicit stop control in the composer. Exact labels keep this
   //    from false-positiving on unrelated icons elsewhere in the document.
-  const stop = document.querySelector(
-    'button[aria-label="Stop response"], button[aria-label="Stop generating"], button[aria-label="Stop"]'
-  );
-  if (stop && stop.offsetParent !== null) return true;
+  //    Visibility uses isRendered, NOT `offsetParent !== null`: per the CSSOM
+  //    spec offsetParent is null for position:fixed elements, so a fixed stop
+  //    button reads as invisible. That blind spot is confirmed at source level
+  //    and does not depend on the shadow question at all.
+  const stop = deepQueryAll(STOP_BTN_SELECTORS)[0] || null;
+  if (stop) {
+    sawComposer = true;
+    if (isRendered(stop)) return 'generating';
+  }
+
   // 3) A disabled send button means the turn still owns the composer.
-  const send = document.querySelector(SEND_BTN_SELECTORS);
-  if (send && send.getAttribute('aria-disabled') === 'true') return true;
-  return false;
+  const send = deepQueryAll(SEND_BTN_SELECTORS)[0] || null;
+  if (send) {
+    sawComposer = true;
+    if (send.getAttribute('aria-disabled') === 'true') return 'generating';
+  }
+
+  // Nothing in the composer was reachable at all: we do not know whether the
+  // turn is running, and must not report that as "finished".
+  return sawComposer ? 'idle' : GENERATION_UNKNOWN;
+}
+
+/**
+ * @returns {boolean} True only when generation is POSITIVELY detected. Anything
+ * needing to distinguish "idle" from "unknown" must use generationState().
+ */
+function isGenerating() {
+  return generationState() === 'generating';
 }
 
 // Text alone is not a render signal: the same characters can be re-laid-out
@@ -338,7 +397,9 @@ class CompletionHeuristic {
   isComplete(diff, snap) {
     if (this.hasErrorSignal(snap)) return { done: true, reason: 'error' };
     if (!this.hasNewContent(snap)) return { done: false, reason: 'waiting-content' };
-    if (isGenerating()) return { done: false, reason: 'still-generating' };
+    // 'idle' rather than !isGenerating(), for the same reason as the narrow
+    // loop: an unseen composer is not evidence that the turn finished.
+    if (generationState() !== 'idle') return { done: false, reason: 'still-generating' };
     if (!this.textStable()) return { done: false, reason: 'waiting-stable' };
     if (this.hasNewCopySignal(snap)) return { done: true, reason: 'copy+stable' };
     if (this.hasNewClickableSignal(snap)) return { done: true, reason: 'clickable+stable' };
@@ -417,7 +478,9 @@ async function observeResponse(config = {}) {
   const extractor = new ResponseExtractor();
 
   function resolveNarrowEl() {
-    const all = document.querySelectorAll(responseSelector);
+    // FLAT FIRST, shadow fallback (#12 robustness, unverified). deepQueryAll
+    // queries light DOM before any shadow root, so this is a strict superset.
+    const all = deepQueryAll(responseSelector);
     if (all.length === 0) return null;
     return responseSelectorStrategy === 'last' ? all[all.length - 1] : all[0];
   }
@@ -426,7 +489,10 @@ async function observeResponse(config = {}) {
   // silently polls the previous turn whenever the chat already had an answer,
   // which returns the old reply; and on a fresh chat the new container may not
   // exist yet, which dropped us to the weaker broad path.
-  const preSend = new Set(document.querySelectorAll(responseSelector));
+  // Must see the SAME node set as pinTarget() below, or "a container created
+  // after we sent" degenerates into "the first container we happen to see" and
+  // hands back the previous turn's answer.
+  const preSend = new Set(deepQueryAll(responseSelector));
   // One budget for the whole turn, not one per phase. The broad phase used to
   // start a fresh `timeoutMs` after the narrow phase had already spent up to
   // 45s, so a turn could occupy the page for nearly twice `timeoutMs` — long
@@ -444,10 +510,14 @@ async function observeResponse(config = {}) {
   let stableSamples = 0;
   let lastPollAt = 0;
   let sawGenerating = false;
+  // Diagnostics: did we ever see the composer during this turn? If never, the
+  // composer was unfindable throughout and any completion reached here rests on
+  // the settle heuristic alone.
+  let sawComposer = false;
   let maxGap = 0;
 
   function pinTarget() {
-    const all = Array.from(document.querySelectorAll(responseSelector));
+    const all = descendantsDeep(document.body, responseSelector, false);
     // Only a container that did not exist before we sent is a candidate.
     // Falling back to a pre-send container here would hand back the previous
     // turn's answer as if it were the reply to this prompt.
@@ -469,8 +539,13 @@ async function observeResponse(config = {}) {
 
     const el = pinTarget();
     const text = el ? (el.textContent || '').trim().replace(/^Gemini said\s*/i, '').trim() : '';
-    const generating = isGenerating();
+    // Three-state on purpose: `generating` alone cannot tell "finished" apart
+    // from "the composer is invisible to us", and only the first of those is a
+    // reason to stop waiting.
+    const genState = generationState();
+    const generating = genState === 'generating';
     if (generating) sawGenerating = true;
+    if (genState !== GENERATION_UNKNOWN) sawComposer = true;
 
     if (text && text.length > lastText.length) {
       const delta = text.slice(lastText.length);
@@ -479,7 +554,7 @@ async function observeResponse(config = {}) {
     }
 
     const fp = renderFingerprint(el);
-    beat('narrow', { textLen: text.length, generating, gap });
+    beat('narrow', { textLen: text.length, generating, genState, gap });
     if (fp && fp === lastFp) {
       stableSamples = gap > STALL_GAP_MS ? 0 : stableSamples + 1;
     } else {
@@ -490,7 +565,11 @@ async function observeResponse(config = {}) {
     // The stop button must have cleared. If it never appeared at all the signal
     // is unverified (Google markup drift), so wait longer rather than less.
     const required = sawGenerating ? STABLE_SAMPLES : STABLE_SAMPLES * 2;
-    if (text && !generating && stableSamples >= required) {
+    // `genState === 'idle'` rather than `!generating`: an UNKNOWN composer must
+    // not end a turn, because that is how an answer gets truncated and reported
+    // as complete. The deadline still applies, so the worst case is a labelled
+    // partial rather than a silent truncation.
+    if (text && genState === 'idle' && stableSamples >= required) {
       for (const sel of errorSelectors) {
         const e = el.querySelector(sel);
         if (e && e.innerText && e.innerText.trim()) throw new Error('Gemini error: ' + e.innerText.trim());
@@ -498,7 +577,11 @@ async function observeResponse(config = {}) {
       // Re-read after declaring done so the caller gets the freshest render
       // rather than the text captured when stability was first noticed.
       const finalText = (el.textContent || '').trim().replace(/^Gemini said\s*/i, '').trim();
-      console.log('[Timepass] narrow done via', sawGenerating ? 'stop-button' : 'sample-count', '| stable', stableSamples, '| maxGap', maxGap, '| len', finalText.length);
+      // sawComposer is a diagnostic, not a gate: it answers "did we ever actually
+      // see the composer during this turn?". If it is false, the generation
+      // signal was blind throughout and this completion rested on the settle
+      // heuristic alone -- the exact condition issue #12 is about.
+      console.log('[Timepass] narrow done via', sawGenerating ? 'stop-button' : 'sample-count', '| stable', stableSamples, '| maxGap', maxGap, '| sawComposer', sawComposer, '| len', finalText.length);
       try { chrome.runtime.sendMessage({ type: "turn_complete", text: finalText, partial: false }); } catch (err) { console.warn('[Timepass] Failed to relay turn completion:', err); }
       return { text: finalText, partial: false, reason: sawGenerating ? 'stop-button' : 'sample-count' };
     }
@@ -524,6 +607,7 @@ async function observeResponse(config = {}) {
     beat('broad', {
       textLen: snap.textLen,
       generating: isGenerating(),
+      genState: generationState(),
       elapsedMs: Date.now() - startedAt,
     });
 
@@ -593,7 +677,10 @@ async function recoverLastResponse(timeoutMs = 45000) {
 
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, pollMs));
-    const all = document.querySelectorAll('response-container');
+    // FLAT FIRST, shadow fallback. If this ever returns nothing the loop runs
+    // to its deadline and throws "never finished rendering" -- indistinguishable
+    // from Gemini genuinely never answering, which feeds straight into #3 and #5.
+    const all = deepQueryAll('response-container');
     if (all.length) pinned = all[all.length - 1];
 
     const text = pinned ? (pinned.textContent || '').trim().replace(/^Gemini said\s*/i, '').trim() : '';
@@ -816,7 +903,11 @@ ElementResolver.prototype.resolveFromSelectors = function (selectors) {
   for (const selector of selectors) {
     let el;
     try {
-      el = document.querySelector(selector);
+      // FLAT FIRST, shadow fallback. The composer is a custom-element stack in
+      // the same family as the rest of the UI; if any part of it is ever not
+      // reachable flat, this is what stops the turn failing with "Input editor
+      // not found" before a single character is typed.
+      el = deepQueryAll(selector)[0] || null;
     } catch {
       continue;
     }
@@ -945,7 +1036,7 @@ function findSendButton() {
   ];
 
   for (const sel of selectors) {
-    const btn = document.querySelector(sel);
+    const btn = deepQueryAll(sel)[0] || null;
     if (btn) return btn;
   }
   return null;
@@ -1041,6 +1132,36 @@ function deepQueryAll(selector) {
     const found = root.querySelectorAll(selector);
     for (const n of found) push(n);
   }
+  return out;
+}
+
+/**
+ * The same search, but rooted at an element instead of the document.
+ *
+ * Needed because a piercing query alone does NOT cover querying INTO an
+ * element: `wrap.querySelector(x)` cannot cross wrap's own shadow boundary, so
+ * a descendant one level of shadow down is invisible no matter how the outer
+ * query was done. Descendant lookup therefore has to be a descent that steps
+ * through shadow roots as it goes.
+ */
+function descendantsDeep(root, selector, includeSelf) {
+  const out = [];
+  const push = n => { if (out.indexOf(n) === -1) out.push(n); };
+  if (includeSelf && root && root.matches && root.matches(selector)) push(root);
+  const walk = node => {
+    if (!node || !node.querySelectorAll) return;
+    const found = node.querySelectorAll(selector);
+    for (const n of found) push(n);
+    // The node itself may be a shadow host. Checking only its children misses
+    // exactly the case that matters here -- querying INTO a `gem-icon-button`
+    // whose icon lives in that button's OWN shadow root.
+    if (node.shadowRoot) walk(node.shadowRoot);
+    const all = node.querySelectorAll('*');
+    for (const el of all) {
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(root);
   return out;
 }
 
@@ -1363,6 +1484,20 @@ if (action === "read_history") {
 
     if (action === "click_button") {
       try {
+        // KNOWN LIMIT (#12), deliberately NOT changed to a deep query.
+        //
+        // Every other lookup in this file searches light DOM first and then open
+        // shadow roots. This one is different: it takes a caller-supplied
+        // selector, and a piercing fallback here would silently change WHICH
+        // element gets clicked when a selector matches more than one node in
+        // different roots. A generic "click this CSS selector" action is also
+        // fundamentally ambiguous across roots -- there is no single answer to
+        // "the button matching X" when X exists in several trees.
+        //
+        // So: flat only, and it fails loudly with the selector rather than
+        // guessing. A shadow-aware version wants to be a separate action whose
+        // contract is defined deliberately (e.g. take a DOM path, or an index
+        // into a documented deep query), not a quiet widening of this one.
         const btn = document.querySelector(payload.selector);
         if (!btn) {
           sendResponse({ success: false, error: "Button not found: " + payload.selector });
@@ -1381,9 +1516,15 @@ if (action === "read_history") {
         success: true,
         url: window.location.href,
         title: document.title,
-        fileInputs: document.querySelectorAll("input[type='file']").length,
-        dropzones: document.querySelectorAll("[xapfileselectordropzone]").length,
-        buttons: document.querySelectorAll("button").length
+        // DEEP, not flat. These are diagnostics, and a flat count is a
+        // misleading one: "file inputs: 0" during the #8 work was read as
+        // "the page has no file input" when it only meant "not reachable from
+        // the light DOM". Counting through shadow roots makes the number mean
+        // what it says. Confirmed defect, independent of the #12 hypothesis.
+        fileInputs: deepQueryAll("input[type='file']").length,
+        dropzones: deepQueryAll("[xapfileselectordropzone]").length,
+        buttons: deepQueryAll("button").length,
+        shadowRootCount: pageShadowRoots().length
       });
       return;
     }
@@ -1437,7 +1578,8 @@ function serializeSubtree(rootSelector, opts = {}) {
     return node;
   }
 
-  const root = rootSelector ? document.querySelector(rootSelector) : document.body;
+  // FLAT FIRST, shadow fallback, so a dom_dump can root inside a shadow root.
+  const root = rootSelector ? (deepQueryAll(rootSelector)[0] || null) : document.body;
   if (!root) return { ok: false, error: `Selector matched nothing: ${rootSelector}` };
   return { ok: true, url: location.href, title: document.title, tree: walk(root, 0) };
 }
