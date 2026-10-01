@@ -6,6 +6,8 @@ import { artifactPath, resolveOutputPath, slugify } from './lib/paths.js'
 import { boundText, formatBytes, summarize } from './lib/text.js'
 import { countNodes, countVisibleNodes, pruneTree } from './lib/tree.js'
 import { sessionGuidance, sessionKind, conversationIdFromUrl, sessionOk } from './lib/session.js'
+import { auditToolRegistry, describeRegistryAudit } from './lib/registry.js'
+import { loadGeminiAdapter } from './adapter-loader.js'
 
 /**
  * The timepass Gemini bridge as model-facing harness tools.
@@ -99,6 +101,10 @@ function statusValue(snapshot, probed) {
       ? 'connected'
       : snapshot.extensionConnected === false ? 'disconnected' : 'unknown',
     port: snapshot.port,
+    // Build identity and every contract finding, so a status call answers
+    // "which build am I actually talking to" and not only "is it up".
+    builds: snapshot.bridge ? buildValue(snapshot.bridge) : undefined,
+    registry: snapshot.registry,
     model: snapshot.model,
     probed,
     connectedAt: snapshot.connectedAt ?? undefined,
@@ -108,6 +114,72 @@ function statusValue(snapshot, probed) {
     transcriptDir: snapshot.transcriptDir,
     cookieToolsEnabled: snapshot.cookieToolsEnabled,
   })
+}
+
+/**
+ * The build half of a status value, flattened to primitives.
+ *
+ * @param {Record<string, any>} info - The driver's bridge info.
+ * @returns {Record<string, unknown>} Build facts that survive a JSON schema.
+ */
+function buildValue(info) {
+  return compact({
+    driverBuildId: info.driverBuildId,
+    expectedExtensionBuildId: info.build?.expectedBuildId,
+    extensionBuildId: info.extensionBuildId,
+    match: info.buildMatch,
+    extensionSourceFingerprint: info.build?.sourceFingerprint,
+    manifestPath: info.build?.manifestPath,
+    missingActions: info.missingActions,
+    diagnostics: info.diagnostics,
+  })
+}
+
+/**
+ * Render the build facts, loudly enough that a mismatch cannot be skimmed past.
+ *
+ * The retest these fields exist for ran a whole session against a service worker
+ * that was not the code on disk, and the only symptom was a handful of results
+ * that did not add up. A status call now has to say so in the first few lines.
+ *
+ * @param {Record<string, any>} builds - The build facts from a status value.
+ * @returns {string[]} One line per fact.
+ */
+function buildLines(builds) {
+  const lines = []
+  const expected = builds.expectedExtensionBuildId
+  const reported = builds.extensionBuildId
+  lines.push(
+    'builds: driver ' + builds.driverBuildId
+    + ' | extension on disk ' + (expected ?? 'unknown')
+    + ' | extension running ' + (reported ?? 'did not report')
+  )
+  if (builds.extensionSourceFingerprint) {
+    lines.push('extension sources: ' + builds.extensionSourceFingerprint + ' (manifest ' + builds.manifestPath + ')')
+  }
+  if (builds.match === 'mismatch') {
+    lines.push(
+      'BUILD MISMATCH: the extension is running ' + reported + ' but the files on disk are ' + expected + '. '
+      + 'Results from this session are NOT from the code you are reading. Reload the extension at '
+      + 'chrome://extensions → Reload, then restart the DSH session.'
+    )
+  } else if (builds.match === 'unknown' && reported === null) {
+    lines.push(
+      'BUILD UNVERIFIED: the extension never identified itself. It either predates the handshake or its '
+      + 'worker is running an older build than the files on disk — Chrome keeps the worker script in '
+      + 'memory, so reload it at chrome://extensions → Reload before trusting these results.'
+    )
+  }
+  if (builds.missingActions?.length) {
+    lines.push(
+      'STALE WORKER: the extension does not handle ' + builds.missingActions.join(', ')
+      + ', which this bridge sends. Reload it at chrome://extensions → Reload.'
+    )
+  }
+  for (const finding of builds.diagnostics ?? []) {
+    lines.push('[' + finding.kind + '] ' + finding.message)
+  }
+  return lines
 }
 
 /**
@@ -123,6 +195,10 @@ function statusLines(value) {
     'default model: ' + value.model,
     'artifacts: screenshots to ' + value.screenshotDir + ', transcripts to ' + value.transcriptDir,
   ]
+  if (value.builds) lines.push(...buildLines(value.builds))
+  if (value.registry) {
+    for (const line of describeRegistryAudit(value.registry)) lines.push('tool registry: ' + line)
+  }
   if (value.lastError) {
     lines.push('last error: ' + value.lastError)
   } else if (value.state === 'ready' && value.extension !== 'connected') {
@@ -177,6 +253,70 @@ function createTools(bridge, config) {
             description: 'Whether the Chrome extension is on the bridge right now.',
           },
           port: { type: 'integer', required: true, description: 'Local WebSocket port the bridge listens on.' },
+          builds: {
+            type: 'object',
+            // DSH's schema compiler rejects any object schema that does not
+            // state this outright, so it is spelled on every nested object here.
+            additionalProperties: false,
+            description:
+              'Which build each end of the bridge is actually running. Read this before trusting a result: '
+              + 'match "mismatch" means the extension is not the code on disk, and "unknown" means it never '
+              + 'said, which usually means the same thing.',
+            properties: {
+              driverBuildId: { type: 'string', description: 'Build id of this host driver.' },
+              expectedExtensionBuildId: { type: 'string', description: 'version from extension/manifest.json on disk.' },
+              extensionBuildId: { type: 'string', description: 'Build the connected extension reports at runtime.' },
+              match: { type: 'string', enum: ['match', 'mismatch', 'unknown'], description: 'Whether the two agree.' },
+              extensionSourceFingerprint: { type: 'string', description: 'Short digest of the extension sources on disk.' },
+              manifestPath: { type: 'string', description: 'Manifest the host read the expectation from.' },
+              missingActions: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Actions this bridge sends that the connected extension does not handle.',
+              },
+              diagnostics: {
+                type: 'array',
+                description: 'Every skew and contract finding recorded so far, most actionable first.',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    kind: { type: 'string', description: 'Finding kind, e.g. build-mismatch or envelope-non-conformant.' },
+                    message: { type: 'string', description: 'What is wrong and how to fix it.' },
+                    at: { type: 'integer', description: 'Epoch millis the finding was recorded.' },
+                  },
+                },
+              },
+            },
+          },
+          registry: {
+            type: 'object',
+            additionalProperties: false,
+            description: 'Audit of registered tools against the adapter methods they call.',
+            properties: {
+              ok: { type: 'boolean', description: 'Whether every registered tool has an adapter method to call.' },
+              missingMethods: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Tool -> method pairs the loaded adapter does not satisfy.',
+              },
+              missingRequired: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Adapter methods the bridge cannot work without, and which are absent.',
+              },
+              unverifiedTools: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Registered tools with no declared adapter method, so the audit cannot vouch for them.',
+              },
+              unregisteredMethods: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Adapter methods with no tool. Informational only.',
+              },
+            },
+          },
           model: { type: 'string', required: true, description: 'Default Gemini model id used by gemini_ask.' },
           probed: { type: 'boolean', required: true, description: 'Whether this answer came from a real round trip.' },
           connectedAt: { type: 'string', description: 'ISO instant the extension connected.' },
@@ -1081,6 +1221,27 @@ function createCommand(bridge, config) {
 }
 
 /**
+ * The loaded adapter class, without waiting for a bridge to be started.
+ *
+ * Returns null when the adapter cannot be loaded at all — which the bridge
+ * reports in far better words on the first real call, and which must not stop
+ * the plugin from mounting here.
+ *
+ * Memoized, so the audit at mount and any later caller share one import.
+ *
+ * @returns {Promise<object | null>} The adapter class, or null.
+ */
+let adapterPrototypePromise = null
+function adapterPrototype() {
+  if (!adapterPrototypePromise) {
+    adapterPrototypePromise = loadGeminiAdapter()
+      .then(module => module.GeminiAdapter)
+      .catch(() => null)
+  }
+  return adapterPrototypePromise
+}
+
+/**
  * Mount the plugin: one bridge, the `gemini_*` tools, and the `/gemini`
  * command.
  *
@@ -1092,10 +1253,27 @@ export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig ?? {})
   const bridge = createBridge(config)
 
-  for (const tool of createTools(bridge, config)) {
+  const tools = createTools(bridge, config)
+  for (const tool of tools) {
     ctx.tools.register(defineTool(tool))
   }
   ctx.commands.register(createCommand(bridge, config))
+
+  // Compare what was just registered against the adapter this process will
+  // actually load. A tool registered against an adapter that predates it is the
+  // failure the last retest ran into silently: the tool exists in the source,
+  // calls a method that is not there, and the model sees an error with no
+  // explanation. Checked at mount so it is on the console before the first call,
+  // and again in gemini_status where the model can read it.
+  adapterPrototype().then(proto => {
+    const audit = auditToolRegistry(tools.map(tool => tool.name), proto)
+    bridge.setRegistryAudit(audit)
+    if (!audit.ok) {
+      for (const line of describeRegistryAudit(audit)) {
+        console.warn('[timepass-gemini] tool registry: ' + line)
+      }
+    }
+  })
 
   // The WebSocket port outlives a single tool call, so it is owned by the fiber:
   // disposing the plugin (a hot reload, or the host shutting down) releases it.

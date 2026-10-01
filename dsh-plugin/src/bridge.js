@@ -137,7 +137,19 @@ export function createBridge(config) {
   let connectedAt = null
   /** @type {string | null} Which module the adapter class came from. */
   let adapterFrom = null
+  /** @type {Record<string, any> | null} Tool-registry audit, until one is set. */
+  let registryAudit = null
   let disposed = false
+
+  /**
+   * Record what the tool-registry audit found, so `gemini_status` can report it.
+   *
+   * @param {Record<string, any> | null} audit - The audit result.
+   * @returns {void}
+   */
+  function setRegistryAudit(audit) {
+    registryAudit = audit
+  }
 
   /**
    * @param {string} message - The transition to report.
@@ -300,6 +312,11 @@ export function createBridge(config) {
       // The driver owns the port; read it back so status stays honest if the
       // project ever makes it configurable.
       port: adapter?.driver?.port ?? BRIDGE_PORT,
+      // Which build is actually on the other end, and everything found wanting
+      // about it. Absent until the bridge connects: the driver can only report
+      // a peer it has spoken to.
+      bridge: adapter?.driver?.getBridgeInfo ? adapter.driver.getBridgeInfo() : null,
+      registry: registryAudit,
       extensionConnected,
       connectedAt,
       adapterFrom,
@@ -335,5 +352,5 @@ export function createBridge(config) {
     }
   }
 
-  return { call, probe, status, dispose }
+  return { call, probe, status, dispose, setRegistryAudit }
 }

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { ExtensionDriver } from './extension-driver.js';
+import { ExtensionDriver, type BridgeDiagnostic } from './extension-driver.js';
+import { readExtensionBuildInfo } from './build-info.js';
 
 /**
  * The action reply and the event stream are separate messages over one socket.
@@ -13,7 +14,9 @@ import { ExtensionDriver } from './extension-driver.js';
 function driverWithSocket() {
   const driver = new ExtensionDriver();
   const send = vi.fn();
-  (driver as any).clientSocket = { readyState: 1, send };
+  // `close` is here because close() is exercised: the handshake timer must not
+  // outlive the bridge, and the driver does close the socket on the way out.
+  (driver as any).clientSocket = { readyState: 1, send, close: vi.fn() };
   return { driver, send };
 }
 
@@ -367,5 +370,224 @@ describe('ExtensionDriver socket ownership', () => {
     expect((driver as any).clientSocket).toBeNull();
 
     await connectPromise;
+  });
+});
+
+/**
+ * The build handshake (issue #10).
+ *
+ * The retest these tests come from was run against a service worker still
+ * executing an older build: the on-disk `background.js` had
+ * `recover_last_response`, the live worker did not, and nothing said so. A whole
+ * recovery path was therefore never exercised while the results were trusted.
+ *
+ * The version comparison catches a mismatch someone remembered to publish. The
+ * action-table audit is the one that matters, because it catches a stale worker
+ * even when nobody bumped `version` — which is what actually happened.
+ */
+describe('ExtensionDriver build handshake', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Feed the driver an extension introduction, as the socket handler would. */
+  function hello(driver: ReturnType<typeof driverWithSocket>['driver'], msg: Record<string, unknown>) {
+    (driver as any).handleMessage({ type: 'bridge_hello', ...msg });
+  }
+
+  it('reports a mismatch when the extension runs a different build than the files on disk', () => {
+    const { driver } = driverWithSocket();
+    const expected = readExtensionBuildInfo().expectedBuildId;
+
+    hello(driver, { buildId: '0.0.1-stale', actions: [] });
+
+    const info = driver.getBridgeInfo();
+    expect(info.buildMatch).toBe('mismatch');
+    expect(info.extensionBuildId).toBe('0.0.1-stale');
+    expect(info.build?.expectedBuildId).toBe(expected);
+    const finding = info.diagnostics.find(d => d.kind === 'build-mismatch');
+    expect(finding).toBeTruthy();
+    // The message has to say how to fix it, not just that it is wrong.
+    expect(finding!.message).toMatch(/chrome:\/\/extensions/);
+  });
+
+  it('confirms a match when the extension reports the build on disk', () => {
+    const { driver } = driverWithSocket();
+    const expected = readExtensionBuildInfo().expectedBuildId;
+
+    hello(driver, { buildId: expected, actions: [] });
+
+    expect(driver.getBridgeInfo().buildMatch).toBe('match');
+    expect(driver.getBridgeInfo().diagnostics.filter(d => d.kind === 'build-mismatch')).toHaveLength(0);
+  });
+
+  it('names the action a stale worker cannot handle', () => {
+    const { driver } = driverWithSocket();
+    const all = driver.getBridgeInfo().knownActions;
+
+    // The live worker's dispatch table, one edit behind the files on disk.
+    hello(driver, {
+      buildId: readExtensionBuildInfo().expectedBuildId,
+      actions: all.filter(action => action !== 'recover_last_response'),
+    });
+
+    const info = driver.getBridgeInfo();
+    expect(info.missingActions).toEqual(['recover_last_response']);
+    const finding = info.diagnostics.find(d => d.kind === 'action-missing');
+    expect(finding?.message).toContain('recover_last_response');
+    expect(finding?.message).toMatch(/chrome:\/\/extensions/);
+  });
+
+  it('says nothing about actions when the extension never listed any', () => {
+    // An old build has no action list at all. Absent is not "handles nothing",
+    // so the driver must not invent a pile of missing-action findings.
+    const { driver } = driverWithSocket();
+    hello(driver, { buildId: '0.9.0' });
+
+    expect(driver.getBridgeInfo().missingActions).toEqual([]);
+    expect(driver.getBridgeInfo().extensionActions).toBeNull();
+  });
+
+  it('reports unknown rather than matching when nothing introduced itself', () => {
+    const { driver } = driverWithSocket();
+
+    const info = driver.getBridgeInfo();
+    expect(info.buildMatch).toBe('unknown');
+    expect(info.extensionBuildId).toBeNull();
+  });
+
+  it('warns once the grace expires on an extension that never says hello', async () => {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+    (driver as any).armHandshakeGrace((driver as any).clientSocket);
+
+    expect(driver.getBridgeInfo().diagnostics).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(3000);
+
+    const finding = driver.getBridgeInfo().diagnostics.find(d => d.kind === 'no-handshake');
+    expect(finding).toBeTruthy();
+    expect(finding!.message).toMatch(/chrome:\/\/extensions/);
+  });
+
+  it('stays silent on the grace timer once the extension has introduced itself', async () => {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+    (driver as any).armHandshakeGrace((driver as any).clientSocket);
+    hello(driver, { buildId: readExtensionBuildInfo().expectedBuildId, actions: [] });
+
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(driver.getBridgeInfo().diagnostics.filter(d => d.kind === 'no-handshake')).toHaveLength(0);
+  });
+
+  it('leaves no handshake timer behind when the bridge closes', async () => {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+    (driver as any).armHandshakeGrace((driver as any).clientSocket);
+
+    await driver.close();
+
+    // The codebase has an explicit rule about timers outliving their work; the
+    // handshake timer is held to it.
+    expect((driver as any).handshakeTimer).toBeNull();
+  });
+
+  it('records a mismatch the extension reported about itself', () => {
+    const { driver } = driverWithSocket();
+
+    (driver as any).handleMessage({ type: 'bridge_mismatch', message: 'worker says 1.0.0, host says 1.1.0' });
+
+    const finding = driver.getBridgeInfo().diagnostics.find(d => d.kind === 'build-mismatch');
+    expect(finding?.message).toContain('1.0.0');
+    expect(finding?.message).toContain('1.1.0');
+  });
+});
+
+/**
+ * Runtime enforcement of the completed-answer envelope, which the type cannot
+ * give: the extension is plain JavaScript and the payload arrives as `any`, so
+ * nothing at build time stops a producer forgetting `turnComplete`.
+ *
+ * What matters is that the loss stops being silent, so each finding names the
+ * action and says whether the answer still reached the caller.
+ */
+describe('ExtensionDriver envelope conformance', () => {
+  /** Run one action to completion with a reply, then return the findings. */
+  async function replyWith(
+    driver: ExtensionDriver,
+    action: string,
+    response: unknown
+  ): Promise<BridgeDiagnostic[]> {
+    const pending = driver.executeAction({ action, timeoutMs: 1000 });
+    const sent = JSON.parse(((driver as any).clientSocket.send as any).mock.calls[0][0]);
+    (driver as any).handleMessage({ id: sent.id, success: true, response });
+    await pending;
+    return driver.getBridgeInfo().diagnostics;
+  }
+
+  it('says the answer was lost when a completed reply omits turnComplete entirely', async () => {
+    const { driver } = driverWithSocket();
+
+    const findings = await replyWith(driver, 'inject_and_send', {
+      success: true, text: 'Blue', chatId: 'chat-1'
+    });
+
+    const finding = findings.find(d => d.kind === 'envelope-non-conformant');
+    expect(finding).toBeTruthy();
+    // Names the action, and says the answer did not survive.
+    expect(finding!.message).toContain('inject_and_send');
+    expect(finding!.message).toMatch(/ANSWER IS LOST/);
+  });
+
+  it('says the answer was delivered anyway when the legacy recovered shape arrives', async () => {
+    const { driver } = driverWithSocket();
+
+    const findings = await replyWith(driver, 'inject_and_send', {
+      success: true, recovered: true, text: 'Blue', chatId: 'chat-1'
+    });
+
+    const finding = findings.find(d => d.kind === 'envelope-non-conformant');
+    expect(finding).toBeTruthy();
+    expect(finding!.message).toMatch(/delivered anyway/);
+    expect(finding!.message).not.toMatch(/ANSWER IS LOST/);
+  });
+
+  it('does not flag a reply that honours the contract', async () => {
+    const { driver } = driverWithSocket();
+
+    const findings = await replyWith(driver, 'inject_and_send', {
+      success: true, turnComplete: true, text: 'Tokyo', chatId: 'chat-1'
+    });
+
+    expect(findings.filter(d => d.kind === 'envelope-non-conformant')).toHaveLength(0);
+  });
+
+  it('does not flag a failure envelope, which has no contract to break', async () => {
+    const { driver } = driverWithSocket();
+
+    const findings = await replyWith(driver, 'inject_and_send', {
+      success: false, error: 'Input editor not found'
+    });
+
+    expect(findings.filter(d => d.kind === 'envelope-non-conformant')).toHaveLength(0);
+  });
+
+  it('checks a late reply too, naming the action that was abandoned', async () => {
+    vi.useFakeTimers();
+    const { driver } = driverWithSocket();
+    const pending = driver.executeAction({ action: 'inject_and_send', timeoutMs: 1000 });
+    await vi.advanceTimersByTimeAsync(20000);
+    const result = await pending;
+    expect(result).toMatchObject({ late: true });
+
+    (driver as any).handleMessage({
+      id: result.id,
+      success: true,
+      response: { success: true, text: 'the whole answer' }
+    });
+
+    const finding = driver.getBridgeInfo().diagnostics.find(d => d.kind === 'envelope-non-conformant');
+    expect(finding?.message).toContain('inject_and_send');
+    vi.useRealTimers();
   });
 });

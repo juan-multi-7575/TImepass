@@ -92,6 +92,17 @@ async function main() {
   for (const entry of ctx.loader.entries()) {
     const state = entry.fiber ? STATE_NAME[entry.fiber.state] : 'UNMOUNTED'
     console.log('  ' + state.padEnd(9) + entry.options.name + (entry.disabled ? ' (disabled)' : ''))
+    // A plugin that failed to mount used to be reported as one word, which is
+    // the same silence issue #10 is about one layer up: the harness could see
+    // that the plugin was gone but not why, so every later check failed for a
+    // reason it never named.
+    if (entry.fiber && entry.fiber.state === 3) {
+      // `_error` is where cordis records a failed plugin's cause; `stack` and
+      // `error` are usually unset, which is why this printed "no reason
+      // recorded" while every later check failed for a reason it never named.
+      const reason = entry.fiber._error || entry.fiber.stack || entry.fiber.error
+      console.log('           ↳ ' + (reason instanceof Error ? reason.message : String(reason ?? 'no reason recorded')))
+    }
   }
 
   const tools = ctx.tools.schemas().filter(schema => schema.name.startsWith('gemini_'))

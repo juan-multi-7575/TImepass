@@ -9,6 +9,78 @@ layer is stale and no amount of retrying will help.
 
 ---
 
+## The reload runbook — do this after ANY extension or plugin change
+
+Three processes load this code independently, and **none of them notices an edit
+on its own**. A test or retest run against any of them can silently exercise
+code that is not the code you are reading, which is worse than a failure because
+it looks like a result.
+
+| What you changed | What you must do |
+|---|---|
+| `extension/*.js`, `extension/manifest.json` | Reload the extension: `chrome://extensions` → **Timepass Gemini Extension** → **Reload**. Then refresh the open `gemini.google.com` tab so the content script is re-injected. |
+| `dsh-plugin/src/**` | Restart the DSH session (or toggle `timepass-gemini` off/on in the plugin manager). A running session keeps the old tool registry and the old schemas. |
+| `src/**` | Restart the DSH session **and** reload the extension. The adapter is loaded host-side but the protocol it speaks is the extension's. |
+| Anything at all, when the harness is **not** running under `tsx` | Run `npm run build` in the timepass project. The plugin prefers `src/index.ts`, which only a tsx-capable runtime can import; otherwise it loads `dist/`, which is gitignored — so `git status` will not show it and your edits will look applied while the old build runs. |
+
+The `dist/` case is the quietest staleness of the lot: a stale build that
+leaves no trace in version control, produces no warning, and is simply what the
+plugin runs.
+
+Why the extension needs an explicit reload: Chrome keeps a manifest V3 service
+worker in memory. Editing `background.js` on disk does nothing to the worker that
+is already running — it keeps executing the previous script, including its old
+dispatch table, until the extension is reloaded. A terminated worker that is
+woken again is re-created from the same cached script, not from your edit.
+
+**Confirm rather than assume.** `gemini_status` now reports it:
+
+- `builds.match: 'match'` — the running extension reports the same
+  `version` as `extension/manifest.json` on disk.
+- `builds.match: 'mismatch'` — it does not. Reload it.
+- `builds.match: 'unknown'` — it never identified itself. Either it predates the
+  handshake or the worker is stale; reload and re-check.
+- `builds.missingActions` — actions this bridge sends that the extension does
+  not handle. This catches a stale worker **even when nobody bumped
+  `version`**, which is the case that actually bites.
+- `builds.diagnostics` — every finding recorded so far, each naming what is
+  wrong and how to fix it.
+
+If `extension/` was changed, also bump `version` in `extension/manifest.json`;
+the build comparison is only as good as that number.
+
+---
+
+## A tool is registered but the model cannot call it
+
+**Symptom:** the plugin source has the tool, the adapter implements its method,
+but the tool is absent from the session's tool list — or calling it errors with
+something that makes no sense.
+
+**Cause:** the DSH session started before the tool was added and still holds the
+old tool registry. Nothing reports this, which is why `gemini_status` now
+carries a `registry` block comparing registered tools against the adapter
+methods they call.
+
+**Fix:** restart the DSH session. The audit names the exact tool and method when
+one is missing, e.g. `gemini_collect -> collectLastResponse`.
+
+---
+
+## `turnComplete` / "ANSWER IS LOST" diagnostics
+
+`gemini_status` reports `builds.diagnostics` with `kind:
+envelope-non-conformant` when a reply looks like a completed answer but omits
+`turnComplete`. The message says whether the answer still reached the caller
+("delivered anyway") or was dropped ("THE ANSWER IS LOST"), and names the action.
+
+This is the runtime guard for `CompletedAnswerEnvelope` in
+`src/adapter/types.ts`: the extension is plain JavaScript, so no build step can
+force a producer to set the field. The host tolerates the omission and still
+returns the answer, but says so out loud rather than passing silently.
+
+---
+
 ## `tool "gemini_ask" returned invalid output: "value.X" is not a declared property (additionalProperties: false)`
 
 **Cause:** the DSH host has a stale copy of the plugin module. The tool's output

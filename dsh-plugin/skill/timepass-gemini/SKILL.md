@@ -53,6 +53,26 @@ If the extension is missing: it is a Chrome extension that must be loaded in
 `chrome://extensions`, and the Gemini tab must be open. See
 `references/troubleshooting.md`.
 
+## Which build are you talking to?
+
+`gemini_status` reports a `builds` block, and it is the difference between
+trusting a result and not:
+
+```
+builds.match === 'match'      the extension is the code on disk
+builds.match === 'mismatch'   it is not — every result this session is suspect
+builds.match === 'unknown'    it never identified itself; usually the same thing
+```
+
+`mismatch` and `unknown` mean the browser is running older code than the files
+you are reading, so a bug you "fixed" may never have run and a bug you
+"reproduced" may be gone. **Do not chase results until this reads `match`** —
+reload the extension at `chrome://extensions` → Reload, and restart the DSH
+session if the tool list itself looks wrong.
+
+`builds.missingActions` names actions the extension cannot handle, which is how
+a stale service worker is detected even when no version was bumped.
+
 ## The answer contract — read this before reporting any answer
 
 Every ask returns flags. They are not decoration; two of them change what you

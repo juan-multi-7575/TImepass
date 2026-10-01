@@ -13,9 +13,38 @@
  * breaks this too.
  */
 import { WebSocket } from 'ws'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** Port the timepass driver listens on. */
 const PORT = 9876
+
+/** Wire revision the handshake speaks; mirrors src/driver/build-info.ts. */
+const PROTOCOL_VERSION = 1
+
+/**
+ * The build this fake claims to be.
+ *
+ * It reports the version from the real extension manifest, so the scratch
+ * harness shows a *match* against the host the way a healthy setup does. Set
+ * FAKE_BUILD_ID to something else to rehearse the skew path — the situation the
+ * last retest ran into without noticing, and one `gemini_status` now names.
+ *
+ * @returns {string} The build id to report.
+ */
+function fakeBuildId() {
+  if (process.env.FAKE_BUILD_ID) return process.env.FAKE_BUILD_ID
+  const manifest = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'extension', 'manifest.json'
+  )
+  try {
+    const parsed = JSON.parse(fs.readFileSync(manifest, 'utf8'))
+    return typeof parsed.version === 'string' ? parsed.version : '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+}
 
 /** A valid 1x1 transparent PNG, so a capture produces a real file on disk. */
 const PNG_1PX = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
@@ -109,6 +138,12 @@ const RESPONSES = {
   }),
   'cookies:get': () => ({ cookies: [{ name: 'SID', value: 'secret', domain: 'gemini.google.com' }] }),
   'cookies:restore': () => ({ ok: true }),
+  // Present so a healthy fake reports no missing actions. Without them the
+  // host's dispatch-table audit (issue #10) correctly flags the fake as stale,
+  // which would teach everyone to ignore a warning that is usually real.
+  tab_close: payload => ({ closed: payload?.tabId ?? null }),
+  tab_switch: payload => ({ switched: payload?.tabId ?? null }),
+  tab_group_list: () => ({ groups: [{ id: 7, title: 'Timepass Gemini', collapsed: false }] }),
 }
 
 /**
@@ -143,6 +178,22 @@ export function startFakeExtension(options = {}) {
    * @returns {void}
    */
   function handle(message) {
+    // The host introduces itself on connect (issue #10). Answer with the same
+    // handshake the real service worker sends, so this harness keeps covering
+    // the version and dispatch-table check rather than going quietly blind to
+    // it the moment the protocol gains a message.
+    if (message?.type === 'bridge_hello') {
+      log('answering bridge_hello as ' + fakeBuildId())
+      socket.send(JSON.stringify({
+        type: 'bridge_hello',
+        protocolVersion: PROTOCOL_VERSION,
+        buildId: fakeBuildId(),
+        actions: Object.keys(RESPONSES),
+        asyncActions: ['type_prompt', 'inject_and_send', 'click_send', 'stream_response', 'recover_last_response'],
+      }))
+      return
+    }
+
     const build = RESPONSES[message?.action]
     if (!build) {
       socket.send(JSON.stringify({ id: message?.id, success: false, error: 'Unknown action: ' + message?.action }))

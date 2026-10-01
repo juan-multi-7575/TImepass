@@ -1,5 +1,12 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { BrowserDriver, ActionPayload, ActionResult } from './driver.interface.js';
+import {
+  BRIDGE_PROTOCOL_VERSION,
+  DRIVER_BUILD_ID,
+  readExtensionBuildInfo,
+  type ExtensionBuildInfo,
+} from './build-info.js';
+import { isCompletedAnswer, type AnswerReplyEnvelope } from '../adapter/types.js';
 
 /**
  * Headroom added to the caller's own budget before an action is abandoned.
@@ -30,6 +37,61 @@ const LATE_RESPONSE_TTL_MS = 30 * 60 * 1000;
 const MAX_LATE_RESPONSES = 20;
 const MAX_ABANDONED_IDS = 50;
 
+/**
+ * How long a freshly connected extension has to identify itself before the
+ * handshake is treated as unsupported.
+ *
+ * An extension that predates the handshake will never send it, so this has to
+ * expire rather than wait forever. It is a one-shot timer per connection and is
+ * cleared on close, the same discipline the per-action timers follow.
+ */
+const HANDSHAKE_GRACE_MS = 3000;
+
+/** Recorded findings are bounded too; a status call must not grow without end. */
+const MAX_DIAGNOSTICS = 50;
+
+/** One recorded finding about the bridge or the contract between its ends. */
+export interface BridgeDiagnostic {
+  kind:
+    | 'build-mismatch'
+    | 'action-missing'
+    | 'envelope-non-conformant'
+    | 'no-handshake'
+    | 'manifest-unreadable';
+  message: string;
+  at: number;
+}
+
+/** What each end of the bridge believes it is, as far as the host can tell. */
+export interface BridgeInfo {
+  connected: boolean;
+  protocolVersion: number;
+  driverBuildId: string;
+  /** The on-disk extension build, or null when the manifest was unreadable. */
+  build: ExtensionBuildInfo | null;
+  /** The build the connected extension reports, or null when it never said. */
+  extensionBuildId: string | null;
+  /**
+   * `unknown` is the honest answer for an extension that never reported: a
+   * worker still running old code looks exactly like one that predates the
+   * handshake, and neither can be told apart from the host side alone.
+   */
+  buildMatch: 'match' | 'mismatch' | 'unknown';
+  /** Every action this driver is willing to send. */
+  knownActions: string[];
+  /** Every action the connected extension says it can handle, or null. */
+  extensionActions: string[] | null;
+  /**
+   * Actions the driver will send that the extension does not claim to handle.
+   *
+   * This is the version-independent detector: it catches a stale worker whose
+   * dispatch table predates an edit even when nobody bumped `version`, which is
+   * exactly how `recover_last_response` went missing without anyone noticing.
+   */
+  missingActions: string[];
+  diagnostics: BridgeDiagnostic[];
+}
+
 export class ExtensionDriver implements BrowserDriver {
   private wss: WebSocketServer | null = null;
   private clientSocket: WebSocket | null = null;
@@ -47,6 +109,21 @@ export class ExtensionDriver implements BrowserDriver {
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
   private connectTimeout: ReturnType<typeof setTimeout> | null = null;
+  /** The action each outstanding id belongs to, for diagnostics naming it. */
+  private requestActions = new Map<string, string>();
+  /** What the on-disk extension build looks like, refreshed on every connect. */
+  private buildInfo: ExtensionBuildInfo | null = null;
+  /** What the connected extension said about itself, or nulls when it said nothing. */
+  private peer: {
+    buildId: string | null;
+    protocolVersion: number | null;
+    actions: string[] | null;
+    asyncActions: string[] | null;
+  } = { buildId: null, protocolVersion: null, actions: null, asyncActions: null };
+  /** Contract and skew findings, bounded and surfaced by {@link getBridgeInfo}. */
+  private diagnostics: BridgeDiagnostic[] = [];
+  /** Fires when a connected extension fails to identify itself in time. */
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private port: number;
   private readonly connectTimeoutMs = 10000;
   private readonly knownActions = new Set([
@@ -68,8 +145,7 @@ export class ExtensionDriver implements BrowserDriver {
     // Re-reads the answer Gemini already saved for the last turn, without
     // re-asking. The freeze watchdog has always used this; exposing it lets a
     // host-side collect recover a turn whose reply never reached the socket.
-    'recover_last_response',
-    'get_page_info'
+    'recover_last_response'
   ]);
 
   constructor(port = 9876) {
@@ -95,6 +171,16 @@ export class ExtensionDriver implements BrowserDriver {
         this.wss.on('connection', (ws) => {
           console.log('[ExtensionDriver] Chrome extension connected over WebSocket.');
           this.clientSocket = ws;
+          // Re-read what is on disk for every connection: the manifest and the
+          // sources are what the loaded build is supposed to match, and a
+          // reload in between must not leave the previous answer standing.
+          this.buildInfo = readExtensionBuildInfo();
+          this.peer = { buildId: null, protocolVersion: null, actions: null, asyncActions: null };
+          if (this.buildInfo.error) {
+            this.record('manifest-unreadable', this.buildInfo.error);
+          }
+          this.sendBridgeHello(ws);
+          this.armHandshakeGrace(ws);
 
           ws.on('message', (data) => {
             try {
@@ -141,6 +227,183 @@ export class ExtensionDriver implements BrowserDriver {
     });
   }
 
+  /**
+   * Introduce ourselves to the extension and say which build we expect.
+   *
+   * Purely additive: a peer that predates this never reads it, and one that does
+   * read it can only warn. Nothing here can fail an action.
+   */
+  private sendBridgeHello(ws: WebSocket): void {
+    try {
+      ws.send(JSON.stringify({
+        type: 'bridge_hello',
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        driverBuildId: DRIVER_BUILD_ID,
+        expectedExtensionBuildId: this.buildInfo?.expectedBuildId ?? null,
+        knownActions: [...this.knownActions],
+      }));
+    } catch (err) {
+      console.warn('[ExtensionDriver] could not send the bridge handshake:', err);
+    }
+  }
+
+  /** Start the one-shot timer that records an extension which never says hello. */
+  private armHandshakeGrace(ws: WebSocket): void {
+    this.clearHandshakeTimer();
+    this.handshakeTimer = setTimeout(() => {
+      this.handshakeTimer = null;
+      if (this.clientSocket !== ws) return;
+      if (this.peer.buildId !== null) return;
+      // Silence here is ambiguous by nature: the extension may predate the
+      // handshake, or its worker may still be running an older build. Either
+      // way the host cannot tell which, so it says so instead of assuming.
+      this.record(
+        'no-handshake',
+        'The extension connected but never identified itself. It either predates the handshake, or its '
+        + 'service worker is still running an older build than the files on disk — Chrome keeps the worker '
+        + 'script in memory, so reload the extension at chrome://extensions → Reload and retry. Until then '
+        + 'every result comes from code that may not be the code on disk.'
+      );
+    }, HANDSHAKE_GRACE_MS);
+    this.handshakeTimer.unref?.();
+  }
+
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+  }
+
+  /**
+   * The on-disk build, read once and reused.
+   *
+   * Read lazily rather than only on connect so a status call answers the
+   * question — "which build is this host expecting?" — even before anything has
+   * connected, which is when an operator most wants to compare builds.
+   */
+  private ensureBuildInfo(): ExtensionBuildInfo | null {
+    if (!this.buildInfo) {
+      this.buildInfo = readExtensionBuildInfo();
+    }
+    return this.buildInfo;
+  }
+
+  /**
+   * Take the extension's introduction: who it is, and what it can handle.
+   *
+   * The action list is the part that earns its keep. A worker running a stale
+   * build reports the dispatch table it actually has, so an action that exists
+   * in the driver's table but not in the extension's is detected here even when
+   * nobody bumped `version`. That is precisely how `recover_last_response`
+   * disappeared without anything failing loudly.
+   */
+  private handleBridgeHello(msg: any): void {
+    this.clearHandshakeTimer();
+    const strings = (value: unknown): string[] | null =>
+      Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : null;
+
+    this.peer = {
+      buildId: typeof msg?.buildId === 'string' ? msg.buildId : null,
+      protocolVersion: typeof msg?.protocolVersion === 'number' ? msg.protocolVersion : null,
+      actions: strings(msg?.actions),
+      asyncActions: strings(msg?.asyncActions),
+    };
+
+    const expected = this.ensureBuildInfo()?.expectedBuildId ?? null;
+    if (this.peer.buildId && expected && this.peer.buildId !== expected) {
+      this.record(
+        'build-mismatch',
+        `Build mismatch: the extension reports version ${this.peer.buildId} but extension/manifest.json says `
+        + `${expected}. The worker is running code that is not the code on disk — reload it at `
+        + 'chrome://extensions → Reload, then restart the DSH session.'
+      );
+    }
+
+    for (const action of this.missingActions()) {
+      this.record(
+        'action-missing',
+        `The connected extension does not list "${action}", which this driver sends. That action is very `
+        + 'likely running a stale service worker: reload the extension at chrome://extensions → Reload.'
+      );
+    }
+  }
+
+  /** Actions the driver will send that the extension did not claim to handle. */
+  private missingActions(): string[] {
+    if (!this.peer.actions) return [];
+    return [...this.knownActions].filter(action => !this.peer.actions!.includes(action));
+  }
+
+  /**
+   * Record a reply that breaks the completed-answer envelope contract.
+   *
+   * This is the runtime enforcement the type cannot give: the extension is plain
+   * JavaScript and the payload arrives as `any`, so nothing at build time can
+   * stop a producer forgetting `turnComplete`. What matters is that the loss
+   * stops being silent, so the finding names the action and says plainly
+   * whether the answer still made it — "the adapter will drop this" is a
+   * different fact from "delivered anyway, this producer predates the envelope".
+   */
+  private auditEnvelope(response: unknown, action: string): void {
+    if (!response || typeof response !== 'object') return;
+    const envelope = response as Record<string, unknown>;
+    // Only completed answers are covered; a failure envelope has no contract.
+    if (envelope.success !== true) return;
+    if (envelope.turnComplete === true) return;
+    // Nothing that looks like text means there is no answer to have lost.
+    if (typeof envelope.text !== 'string') return;
+
+    const delivered = isCompletedAnswer(response);
+    this.record(
+      'envelope-non-conformant',
+      `Reply for "${action}" looks like a completed answer but omits turnComplete. `
+      + (delivered
+        ? 'It carries recovered, so the answer was delivered anyway — this producer predates the shared '
+          + 'envelope in src/adapter/types.ts.'
+        : 'It carries neither turnComplete nor recovered, so the adapter treats it as a failure and THE '
+          + 'ANSWER IS LOST. Fix the producer in extension/ to set turnComplete: true.')
+    );
+  }
+
+  private record(kind: BridgeDiagnostic['kind'], message: string): void {
+    this.diagnostics.push({ kind, message, at: Date.now() });
+    while (this.diagnostics.length > MAX_DIAGNOSTICS) {
+      this.diagnostics.shift();
+    }
+    console.warn(`[ExtensionDriver] ${kind}: ${message}`);
+  }
+
+  /**
+   * What each end of the bridge believes it is, and everything found wanting.
+   *
+   * This is the answer to "which build am I actually talking to", which during
+   * the retest that produced issue #10 nobody could give.
+   */
+  getBridgeInfo(): BridgeInfo {
+    const build = this.ensureBuildInfo();
+    const expected = build?.expectedBuildId ?? null;
+    const buildMatch: BridgeInfo['buildMatch'] =
+      !expected || !this.peer.buildId
+        ? 'unknown'
+        : this.peer.buildId === expected
+          ? 'match'
+          : 'mismatch';
+
+    return {
+      connected: !!this.clientSocket && this.clientSocket.readyState === WebSocket.OPEN,
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      driverBuildId: DRIVER_BUILD_ID,
+      build,
+      extensionBuildId: this.peer.buildId,
+      buildMatch,
+      knownActions: [...this.knownActions],
+      extensionActions: this.peer.actions,
+      missingActions: this.missingActions(),
+      diagnostics: [...this.diagnostics],
+    };
+  }
+
   async executeAction<T>(payload: ActionPayload): Promise<ActionResult<T>> {
     if (!this.clientSocket || this.clientSocket.readyState !== WebSocket.OPEN) {
       return { success: false, error: 'Extension not connected over WebSocket bridge.' };
@@ -160,6 +423,8 @@ export class ExtensionDriver implements BrowserDriver {
 
     return new Promise((resolve) => {
       this.pendingRequests.set(id, resolve);
+      // Remembered so a contract violation can name the action that broke it.
+      this.requestActions.set(id, payload.action);
       this.clientSocket!.send(JSON.stringify({ id, ...payload }));
 
       // Timeout safety. Keep the handle: the reply path already deletes the
@@ -171,6 +436,7 @@ export class ExtensionDriver implements BrowserDriver {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
           this.pendingTimers.delete(id);
+          this.requestActions.delete(id);
           // Giving up the *wait* is not losing the work: the request is already
           // in flight. Remember the id so that if the extension answers after
           // this point, the reply is kept rather than dropped for having no
@@ -224,6 +490,25 @@ export class ExtensionDriver implements BrowserDriver {
   private handleMessage(msg: any): void {
     if (msg.type === 'ping') return; // Ignore heartbeats
 
+    // The extension's introduction. Handled before anything else because a
+    // stale worker's dispatch table is the whole point of asking.
+    if (msg.type === 'bridge_hello') {
+      this.handleBridgeHello(msg);
+      return;
+    }
+    // The extension comparing our advertised build against its own and finding
+    // them different. Reported rather than guessed, so it shows up in the tool
+    // output and not only in a devtools console nobody has open.
+    if (msg.type === 'bridge_mismatch') {
+      this.record(
+        'build-mismatch',
+        typeof msg.message === 'string' && msg.message
+          ? `The extension reports a build mismatch: ${msg.message}`
+          : 'The extension reports a build mismatch against the driver it is connected to.'
+      );
+      return;
+    }
+
     if (msg.type === 'extension_log') {
       const source = msg.source === 'background' ? 'Background' : 'Content';
       const prefix = `[Extension:${source}:${msg.level.toUpperCase()}]`;
@@ -245,6 +530,9 @@ export class ExtensionDriver implements BrowserDriver {
         clearTimeout(timer);
         this.pendingTimers.delete(msg.id);
       }
+      const action = this.requestActions.get(msg.id) ?? 'unknown action';
+      this.requestActions.delete(msg.id);
+      this.auditEnvelope(msg.response, action);
       resolver({ success: msg.success !== false, data: msg.response, error: msg.error, id: msg.id });
       return;
     }
@@ -256,6 +544,7 @@ export class ExtensionDriver implements BrowserDriver {
     if (msg.id && this.abandoned.has(msg.id)) {
       const entry = this.abandoned.get(msg.id)!;
       this.abandoned.delete(msg.id);
+      this.auditEnvelope(msg.response, entry.action);
       this.lateResponses.set(msg.id, {
         at: Date.now(),
         action: entry.action,
@@ -305,6 +594,8 @@ export class ExtensionDriver implements BrowserDriver {
   }
 
   async close(): Promise<void> {
+    this.clearHandshakeTimer();
+    this.requestActions.clear();
     if (this.clientSocket) {
       this.clientSocket.close();
       this.clientSocket = null;
