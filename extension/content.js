@@ -1,9 +1,33 @@
 // Timepass Gemini Extension - Content Script (gemini.google.com)
 
-// ===== ONE-TIME SETUP (guarded against re-injection) =====
-if (!window.__timepass_content_loaded) {
+// ===== WHOLE-FILE IDEMPOTENCY GUARD =====
+// The body below is deliberately NOT re-indented. Wrapping 1100+ lines in a
+// block would bury the actual change under whitespace and make the diff
+// unreviewable; JavaScript does not care, and the guard is what matters.
+
+// This file is a *classic* script, not a module. A second evaluation into the
+// same document re-enters the SAME global lexical environment, so every
+// top-level `const`/`let`/`class` in this file collides with the one left by
+// the previous evaluation and throws
+//   SyntaxError: Identifier 'CLICKABLE_CANDIDATE_SELECTOR' has already been declared
+// at PARSE time -- which kills the entire file, including the listener guard at
+// the bottom. Re-injection could therefore never succeed, by construction.
+// The service worker's own "reset the flag, then re-inject" path hits exactly
+// this: the flag it resets sits *below* the parse-time failure.
+//
+// Two properties are needed and neither is sufficient alone:
+//   * the IIFE gives every declaration its own function scope, so a second
+//     evaluation cannot collide even if the flag check were somehow bypassed;
+//   * the early return makes a second injection a genuine no-op, so the console
+//     interceptor is not wrapped twice (which would double every log line) and
+//     the message listener is not registered twice.
+(function () {
+  if (window.__timepass_content_loaded) return;
   window.__timepass_content_loaded = true;
 
+  try {
+
+  // ===== ONE-TIME SETUP =====
   // Remote console log interceptor with rate limiting
   const originalLog = console.log;
   const originalWarn = console.warn;
@@ -88,13 +112,10 @@ if (!window.__timepass_content_loaded) {
   });
 
   console.log("[Timepass Content Script] Loaded on gemini.google.com");
-}
 
-// ===== ALWAYS-ON FUNCTIONALITY (runs on every injection) =====
-
-if (!window.__timepass_activeMutationObserver) {
-  window.__timepass_activeMutationObserver = null;
-}
+// (the vestigial __timepass_activeMutationObserver flag that used to sit here
+// was written and read nowhere else in the repo; it is dropped rather than
+// carried inside the new guard.)
 
 // ========== BROAD DOM READER ENGINE (site-agnostic) ==========
 
@@ -242,13 +263,24 @@ function renderFingerprint(el) {
 // Liveness beacon for the service worker. A slow-but-alive page keeps emitting
 // this; a tab whose main thread is blocked goes completely silent, and that
 // silence is the only reliable way to tell the two apart from outside the tab.
+//
+// EVERY wait that can outlast the watchdog's silence window must call this. A
+// turn that stops emitting looks exactly like a frozen tab, and the worker's
+// response to that is to reload the page -- destroying a live answer and forcing
+// the fragile recovery path. That is not theoretical: the broad fallback loop
+// used to go silent here for every turn past narrowDeadline, which is why every
+// long ask took a ~60s watchdog detour.
+//
+// `phase` is required rather than optional: it makes the telemetry self-
+// describing, so a silence window can be attributed to a polling phase instead
+// of being guessed at from the surrounding log lines.
 let lastBeatAt = 0;
-function beat(extra) {
+function beat(phase, extra) {
   const now = Date.now();
   if (now - lastBeatAt < 2000) return;
   lastBeatAt = now;
   try {
-    chrome.runtime.sendMessage(Object.assign({ type: 'turn_heartbeat', ts: now }, extra || {}));
+    chrome.runtime.sendMessage(Object.assign({ type: 'turn_heartbeat', ts: now, phase }, extra || {}));
   } catch {
     /* worker asleep; the watchdog simply sees an older beat */
   }
@@ -447,7 +479,7 @@ async function observeResponse(config = {}) {
     }
 
     const fp = renderFingerprint(el);
-    beat({ textLen: text.length, generating, gap });
+    beat('narrow', { textLen: text.length, generating, gap });
     if (fp && fp === lastFp) {
       stableSamples = gap > STALL_GAP_MS ? 0 : stableSamples + 1;
     } else {
@@ -484,6 +516,16 @@ async function observeResponse(config = {}) {
     const snap = reader.snapshot();
     const diff = differ.diff(prevSnap, snap);
     heuristic.push(snap);
+
+    // THE heartbeat this loop was missing. Without it, every turn that outlived
+    // narrowDeadline went completely silent while perfectly healthy, and the
+    // worker read that silence as a frozen tab and reloaded the page mid-answer.
+    // Any loop that waits on the page owes the worker a beat.
+    beat('broad', {
+      textLen: snap.textLen,
+      generating: isGenerating(),
+      elapsedMs: Date.now() - startedAt,
+    });
 
     console.log('[Timepass] poll textLen', snap.textLen, 'delta', diff.textDelta, 'added', diff.added, 'changed', diff.changed, 'layout', diff.layoutShifts);
 
@@ -564,7 +606,7 @@ async function recoverLastResponse(timeoutMs = 45000) {
     if (fp && fp === lastFp) stableSamples += 1;
     else stableSamples = 0;
     lastFp = fp;
-    beat({ textLen: text.length, generating: isGenerating(), recovering: true });
+    beat('recovering', { textLen: text.length, generating: isGenerating(), recovering: true });
 
     // A freshly reloaded page usually has no stop button, but if Gemini shows
     // the turn is still running, keep waiting rather than returning a
@@ -841,6 +883,13 @@ function simulateTyping(element, text) {
     let relocations = 0;
     const MAX_RELOCATIONS = 5;
     const interval = setInterval(() => {
+      // The worker arms its freeze watchdog the moment it dispatches
+      // inject_and_send, which is BEFORE any of this typing happens. A long
+      // prompt takes 15 chars per tick, so without a beat here the page is
+      // silent for the whole typing phase and a healthy long ask can look
+      // frozen before the response loop has even started.
+      beat('typing', { typedChars: i, promptLen: text.length });
+
       if (!current.isConnected) {
         relocations++;
         if (relocations > MAX_RELOCATIONS) {
@@ -902,42 +951,262 @@ function findSendButton() {
   return null;
 }
 
-// Read conversation history from the Gemini sidebar (best-effort, resilient)
-function readHistory() {
-  try {
-    const items = [];
-    const seen = new Set();
-    const sidebar = document.querySelector('aside, [class*="sidebar"], [class*="history-pane"]');
-    const links = sidebar ? sidebar.querySelectorAll('a[href*="/app/"]') : [];
-    for (const link of links) {
-      const url = link.href;
-      const title = (link.textContent || "").trim();
-      if (!url || seen.has(url)) continue;
-      if (!title && url.endsWith("/app")) continue;
-      seen.add(url);
-      items.push({ title: title || url, url });
+// --- Conversation history (sidebar) -----------------------------------------
+//
+// The extension drives a PINNED BACKGROUND TAB, where Gemini collapses the
+// history sidebar by default. Collapsed means there are no `a[href*="/app/"]`
+// nodes at all, so the old read returned an empty list -- indistinguishable
+// from a user who genuinely has no conversations. `gemini_history` then said
+// "no conversations" while three existed.
+//
+// Two rules make the failure visible instead of silent:
+//   1. read the sidebar only after it has been opened (re-querying AFTER the
+//      click, never returning the pre-click snapshot); and
+//   2. if the sidebar cannot be confirmed open, return an ERROR carrying
+//      diagnostics -- never an empty `history` array.
+
+const SIDEBAR_CONTAINER_SELECTORS = [
+  'aside',
+  '[class*="sidebar"]',
+  '[class*="history-pane"]',
+  'mat-sidenav',
+  '[role="navigation"]',
+];
+
+// Labels that mean "show me the side panel". Matched against the accessible
+// name, not a hardcoded selector, because this is obfuscated Angular markup
+// that changes without notice.
+const SIDEBAR_TOGGLE_NAME = /(open|expand|show|menu|chats|history|conversation)/i;
+
+const HISTORY_PROBE_TIMEOUT_MS = 3000;
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function isRendered(el) {
+  if (!el) return false;
+  return el.offsetParent !== null || (typeof el.getClientRects === 'function' && el.getClientRects().length > 0);
+}
+
+function accessibleName(el) {
+  if (!el) return '';
+  return (el.getAttribute('aria-label') || el.getAttribute('title') ||
+          el.getAttribute('mattooltip') || (el.textContent || '')).trim();
+}
+
+// --- Shadow-aware lookup ----------------------------------------------------
+//
+// Live page inspection during the #8 work found `gem-button` / `mat-menu`
+// elements that a page-context querySelectorAll cannot see, which means parts
+// of this UI sit behind open shadow roots. It is not established that the
+// history sidebar itself does, but flat querying is demonstrably unreliable
+// here, so every lookup below searches light DOM *and* open shadow roots.
+// If the sidebar turns out to be flat, this costs a little and changes nothing.
+
+let shadowCache = null;
+
+function shadowRootsWithin(root) {
+  const roots = [];
+  const walk = node => {
+    const all = node.querySelectorAll ? node.querySelectorAll('*') : [];
+    for (const el of all) {
+      if (el.shadowRoot) { roots.push(el.shadowRoot); walk(el.shadowRoot); }
     }
-    return { success: true, history: items };
+  };
+  walk(root);
+  return roots;
+}
+
+/**
+ * Every open shadow root on the page. Cached briefly because this is reached
+ * from a 100ms poll loop and a full walk of a heavy SPA on every tick is not
+ * acceptable; the UI settles well inside the TTL.
+ */
+function pageShadowRoots() {
+  const now = Date.now();
+  if (shadowCache && now - shadowCache.at < 1000) return shadowCache.roots;
+  const roots = shadowRootsWithin(document.body);
+  shadowCache = { at: now, roots };
+  return roots;
+}
+
+/** querySelectorAll across light DOM and every open shadow root, de-duplicated. */
+function deepQueryAll(selector) {
+  const out = [];
+  const push = n => { if (out.indexOf(n) === -1) out.push(n); };
+  const light = document.querySelectorAll ? document.querySelectorAll(selector) : [];
+  for (const n of light) push(n);
+  for (const root of pageShadowRoots()) {
+    const found = root.querySelectorAll(selector);
+    for (const n of found) push(n);
+  }
+  return out;
+}
+
+function findSidebarContainer() {
+  for (const sel of SIDEBAR_CONTAINER_SELECTORS) {
+    const found = deepQueryAll(sel);
+    if (found.length) return found[0];
+  }
+  return null;
+}
+
+/**
+ * Conversation links. Scoped to the sidebar when one can be identified, and
+ * searched through shadow roots either way. Falls back to the whole document
+ * so a selector drift in the container does not silently yield zero results.
+ */
+function conversationLinks() {
+  const sidebar = findSidebarContainer();
+  if (sidebar) {
+    const inSidebar = [];
+    const push = n => { if (inSidebar.indexOf(n) === -1) inSidebar.push(n); };
+    const light = sidebar.querySelectorAll('a[href*="/app/"]');
+    for (const n of light) push(n);
+    for (const root of shadowRootsWithin(sidebar)) {
+      const found = root.querySelectorAll('a[href*="/app/"]');
+      for (const n of found) push(n);
+    }
+    if (inSidebar.length) return inSidebar;
+  }
+  return deepQueryAll('a[href*="/app/"]');
+}
+
+/** The control that opens the sidebar, or null. */
+function findSidebarToggle() {
+  // Preferred: something that declares its own expanded state.
+  const declared = deepQueryAll(
+    '[aria-expanded], [aria-controls*="sidenav" i], mat-sidenav [aria-label], button[aria-label]'
+  );
+  const candidates = declared.concat(deepQueryAll('button, [role="button"], mat-icon-button'));
+
+  for (const el of candidates) {
+    if (!isRendered(el)) continue;
+    const name = accessibleName(el);
+    if (name && SIDEBAR_TOGGLE_NAME.test(name) && el.getAttribute('aria-expanded') !== 'true') {
+      return el;
+    }
+  }
+  return null;
+}
+
+/** Can we positively tell the sidebar is open even if it holds no links? */
+function sidebarIsConfirmedOpen() {
+  return deepQueryAll('[aria-expanded="true"], mat-sidenav[opened], [aria-expanded="true"] mat-sidenav').length > 0;
+}
+
+function sidebarDiagnostics() {
+  const sidebar = findSidebarContainer();
+  const buttons = deepQueryAll('button, [role="button"], mat-icon-button');
+  const labels = [];
+  for (let i = 0; i < buttons.length && labels.length < 12; i++) {
+    const name = accessibleName(buttons[i]);
+    if (name) labels.push(name.slice(0, 60));
+  }
+  return {
+    sidebarContainerFound: !!sidebar,
+    sidebarSelector: sidebar ? (sidebar.tagName || '').toLowerCase() : null,
+    toggleFound: !!findSidebarToggle(),
+    linkCount: conversationLinks().length,
+    buttonLabels: labels,
+  };
+}
+
+/**
+ * Open the history sidebar if it is closed.
+ * @returns {Promise<{ok: boolean, reason?: string, diagnostics?: object, confirmedEmpty?: boolean}>}
+ */
+async function ensureSidebarExpanded(options) {
+  const timeoutMs = (options && options.timeoutMs) || HISTORY_PROBE_TIMEOUT_MS;
+  if (conversationLinks().length > 0) return { ok: true, reason: 'already-open' };
+
+  const toggle = findSidebarToggle();
+  if (!toggle) {
+    // No control to click: we cannot claim the list is empty, because we never
+    // managed to look inside.
+    return { ok: false, reason: 'no-toggle-found', diagnostics: sidebarDiagnostics() };
+  }
+
+  toggle.click();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(100);
+    if (conversationLinks().length > 0) return { ok: true, reason: 'expanded' };
+  }
+
+  // Clicked, waited, still nothing. If the DOM positively reports the sidebar as
+  // open then the user really has no conversations; otherwise we simply could
+  // not read it, and that must not masquerade as an empty history.
+  if (sidebarIsConfirmedOpen()) return { ok: true, reason: 'expanded-but-empty', confirmedEmpty: true };
+  return { ok: false, reason: 'no-links-after-expand', diagnostics: sidebarDiagnostics() };
+}
+
+function historyItemsFrom(links) {
+  const items = [];
+  const seen = new Set();
+  for (const link of links) {
+    const url = link.href;
+    const title = (link.textContent || "").trim();
+    if (!url || seen.has(url)) continue;
+    if (!title && url.endsWith("/app")) continue;
+    seen.add(url);
+    items.push({ title: title || url, url });
+  }
+  return items;
+}
+
+// Read conversation history, opening the sidebar first if it is collapsed.
+async function readHistory(payload) {
+  try {
+    const res = await ensureSidebarExpanded(payload);
+    if (!res.ok) {
+      return {
+        success: false,
+        error: 'Could not read Gemini conversation history: the sidebar could not be opened (' +
+               res.reason + '). Refusing to report an empty history, because an unreadable ' +
+               'sidebar is indistinguishable from an empty one.',
+        diagnostics: res.diagnostics,
+      };
+    }
+    const history = historyItemsFrom(conversationLinks());
+    return { success: true, history, sidebarState: res.reason, confirmedEmpty: history.length === 0 };
   } catch (err) {
     return { success: false, error: err.message };
   }
 }
 
-// Select a conversation from the Gemini sidebar by title or url
-function selectHistory(target) {
+// Select a conversation by title or url. Opens the sidebar itself, so it works
+// standalone without a prior read_history call.
+async function selectHistory(target) {
   const title = (target && target.title || "").trim().toLowerCase();
   const url = target && target.url;
-  const sidebar = document.querySelector('aside, [class*="sidebar"], [class*="history-pane"]');
-  const links = sidebar ? sidebar.querySelectorAll('a[href*="/app/"]') : [];
-  for (const link of links) {
-    const matchTitle = title && (link.textContent || "").trim().toLowerCase().includes(title);
-    const matchUrl = url && link.href === url;
-    if (matchTitle || matchUrl) {
-      link.click();
-      return { success: true, url: link.href };
-    }
+  if (!title && !url) {
+    return { success: false, error: "History item not found: (no target)" };
   }
-  return { success: false, error: "History item not found: " + (title || url || "(no target)") };
+  try {
+    const res = await ensureSidebarExpanded(target);
+    if (!res.ok) {
+      return {
+        success: false,
+        error: 'Could not open Gemini conversation history (' + res.reason + '), so "' +
+               (title || url) + '" could not be matched.',
+        diagnostics: res.diagnostics,
+      };
+    }
+    const links = conversationLinks();
+    for (const link of links) {
+      const matchTitle = title && (link.textContent || "").trim().toLowerCase().includes(title);
+      const matchUrl = url && link.href === url;
+      if (matchTitle || matchUrl) {
+        link.click();
+        return { success: true, url: link.href };
+      }
+    }
+    return { success: false, error: "History item not found: " + (title || url || "(no target)") };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 }
 
 // Chrome message handler (registered only once per page load)
@@ -999,22 +1268,46 @@ if (!window.__timepass_listener_registered) {
       (async () => {
         try {
           const text = await recoverLastResponse((payload && payload.timeoutMs) || 45000);
-          sendResponse({ success: true, recovered: true, text, chatId: window.location.href });
+          // Conforms to CompletedAnswerEnvelope in src/adapter/types.ts. This
+          // producer used to omit `turnComplete`, which is the one shape the
+          // adapter classifies as a failure -- so a fully recovered answer was
+          // thrown away and the user got an error instead of it. The adapter now
+          // tolerates the legacy shape, but every producer is expected to
+          // conform; see issue #5.
+          sendResponse({
+            success: true,
+            turnComplete: true,
+            recovered: true,
+            text,
+            chatId: window.location.href,
+          });
         } catch (err) {
+          // A failed recovery is NOT a completed answer: there is no text and
+          // the turn did not finish, so this must not claim turnComplete. It
+          // stays flagged `recovered` to say which path produced the failure.
           sendResponse({ success: false, recovered: true, error: err.message });
         }
       })();
       return true; // keep message channel open for async
     }
 
-    if (action === "read_history") {
-      sendResponse(readHistory());
-      return;
+    // Both of these are async because opening the sidebar means clicking a control
+// and waiting for the list to render. They MUST return true: a listener that
+// returns undefined closes the message channel immediately, and the response
+// would be discarded as "no receiver". This is the single most likely way to
+// break these tools again -- see issue #7.
+if (action === "read_history") {
+      readHistory(payload)
+        .then(sendResponse)
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true; // keep message channel open for async
     }
 
     if (action === "select_history") {
-      sendResponse(selectHistory(payload));
-      return;
+      selectHistory(payload)
+        .then(sendResponse)
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true; // keep message channel open for async
     }
 
     if (action === "dom_dump") {
@@ -1056,6 +1349,7 @@ if (!window.__timepass_listener_registered) {
 
       button.click();
       sendResponse({ success: true });
+      return;
     }
 
     if (action === "get_status") {
@@ -1064,6 +1358,7 @@ if (!window.__timepass_listener_registered) {
         url: window.location.href,
         hasInput: !!findInputEditor()
       });
+      return;
     }
 
     if (action === "click_button") {
@@ -1078,6 +1373,7 @@ if (!window.__timepass_listener_registered) {
       } catch (err) {
         sendResponse({ success: false, error: err.message });
       }
+      return;
     }
 
     if (action === "get_page_info") {
@@ -1089,6 +1385,7 @@ if (!window.__timepass_listener_registered) {
         dropzones: document.querySelectorAll("[xapfileselectordropzone]").length,
         buttons: document.querySelectorAll("button").length
       });
+      return;
     }
 
     // Fallback: any unhandled action must still respond with an object
@@ -1144,3 +1441,13 @@ function serializeSubtree(rootSelector, opts = {}) {
   if (!root) return { ok: false, error: `Selector matched nothing: ${rootSelector}` };
   return { ok: true, url: location.href, title: document.title, tree: walk(root, 0) };
 }
+
+  } catch (err) {
+    // A half-installed script must not permanently block the retry path. If the
+    // body threw, drop BOTH flags so the next injection starts from scratch
+    // rather than finding a world marked "loaded" that never got its listener.
+    delete window.__timepass_content_loaded;
+    delete window.__timepass_listener_registered;
+    throw err;
+  }
+})();
